@@ -1,0 +1,1263 @@
+//@version=5
+// ==========================================================================
+//  ICC_TradesBySci_Strategy_v3.9.0.pine
+//  Pine v5 STRATEGY twin of Expert Advisor ICC_TradesBySci_EA_v3.9.0.mq5
+//  Sci-style Indication -> Correction -> Continuation (ICC) pullback entries.
+//  BACKTESTING STRATEGY (fires backtest orders + alerts/webhooks; it is a
+//  strategy, not a study/indicator).
+//
+//  v3.9.0 icc_ml_v2 TRUE-2R TRADE PAYLOAD — 2026-08-28. ADDITIVE. On each
+//  CLOSED trade, emits a JSON "trade" payload carrying frozen signal-time
+//  features plus reached_1r..reached_10r and exit_r, computed from the
+//  post-entry MFE in R (1R = |entry - initial stop|). This is the Pine
+//  mirror of the EA icc_ml_v2 one-row-per-trade dataset, so a genuine 2R
+//  classifier can be trained from webhook output. No ICC entry, exit,
+//  sizing, or R-engine rule is changed.
+//
+//  v3.8.1 STARTUP VERIFICATION PAYLOAD — 2026-08-28. ADDITIVE. Emits a
+//  one-time JSON "startup" heartbeat on the first confirmed bar so the
+//  alert/webhook pipeline can be validated even before any ICC signal
+//  fires (mirrors the EA v3.8.1 CSV-header-at-init fix). Also stamps a
+//  schema_version and payload_type on the signal JSON. No ICC entry,
+//  exit, sizing, or R-engine rule is changed.
+//
+//  v3.8.0 ML FEATURE EXPANSION — 2026-08-27. ADDITIVE telemetry only.
+//  Adds signal-time features for nearest same-direction FVG midpoint distance,
+//  OTE depth, FVG size normalized by ATR, initial risk distance, spread,
+//  time-of-day, and symbol. Values are added to JSON/Data Window outputs;
+//  no ICC entry, exit, sizing, or R-engine rule is changed.
+//
+//  v3.7.0 ML ENABLEMENT LAYER — 2026-08-27. ADDITIVE and default OFF.
+//  Preserves the Sci ICC signal engine and adds an ML-ready feature layer:
+//  observe/filter modes, manual or embedded-surrogate probabilities, forecast
+//  agreement, regime/session features, confidence-based sizing, runner
+//  selection, dashboard telemetry, Data Window plots and JSON alert export.
+//  A trained model remains external; Pine cannot train a model in-script.
+//
+//  v3.6.1 DUAL FLOATING-P/L READOUT — 2026-08-27. Adds a dashboard row
+//  showing the open position's unrealised result in BOTH account-currency $
+//  (strategy.openprofit) AND pips, so results are judged in $ (what hits the
+//  account) and pips (the chart behaviour the runner reacts to). Read-only;
+//  no engine/entry/exit change. Mirrors the EA v3.6.1 dashboard row.
+//
+//  v3.6.0 EXIT ENGINE OVERHAUL (R-MULTIPLE PHASED RUNNER) — 2026-08-27.
+//  Mirrors EA v3.6.0 1:1. Replaces the pip-based Let-Winners-Run ratchet
+//  (which trailed CURRENT PRICE and could eject a valid trend) with a staged
+//  R-MULTIPLE model measured from the ACTUAL initial risk (1R = |avg entry -
+//  initial stop|), so protection self-scales to each setup and to volatility
+//  (no arbitrary pips). Stages: (Phase 2) PROTECT at +protectAtR -> break-
+//  even; (Phase 2b) LOCK +lockProfitR at +lockAtR; (Phase 3) ACTIVATE a
+//  STRUCTURE RUNNER at +activateAtR that follows CONFIRMED protected
+//  structure (external primary, internal aggressive) PLUS a progressive R
+//  give-back profit floor and a wide ATR emergency floor — the MOST-
+//  PROTECTIVE valid level wins, the stop only ratchets TIGHTER (re-issued via
+//  strategy.exit), and ordinary retracements no longer eject the trade. A
+//  TREND-HEALTH governor HOLDS when HEALTHY, tightens to internal structure
+//  on CAUTION, and EXITS on a CONFIRMED EXTERNAL reversal (external BOS
+//  against the trade). An opposite ICC signal ALONE no longer closes a
+//  runner (it also needs a confirmed external reversal when
+//  closeOnConfirmedRev). Optional PARTIAL (e.g. 25% at +activateAtR) leaves
+//  the rest to run. No fixed TP; no time-based exit. Master useRexit=OFF
+//  restores the EXACT v3.5.0 Let-Winners-Run management. New input group
+//  "Exit Engine v3.6"; NOTHING in the SMC engine, ICC state machine, sizing,
+//  kill zones, OTE, FVG, OB, or structural-TP math changed.
+//
+//  v3.5.0 SCI-PURITY CLEANUP + LET-WINNERS-RUN — 2026-08-26. Mirrors the
+//  EA v3.5.0 change set 1:1 so both engines stay identical.
+//    (A) REMOVED every entry path that is NOT the Trades-by-Sci ICC model:
+//        (1) the v1 CASCADE BREAKOUT path (UseCascadeEntries + buyCont/
+//            sellCont/cascBuy/cascSell) — chasing a breakout is the opposite
+//            of an ICC pullback; (2) the classic S/R RETEST-CONFIRMATION
+//            entry (UseRetestEntries + retestBuySig/retestSellSig +
+//            lastResLvl/lastSupLvl crossovers) — a retail horizontal-level
+//            retest, not an SMC liquidity entry; (3) the v1 STRICTALIGN
+//            4-TF lockstep gate ("leave OFF for Sci style"). (The generic
+//            UTC session filter removed from the EA never existed in Pine —
+//            the kill-zone engine has always been the only session model
+//            here — so there is nothing to strip for that item.) Only the
+//            genuine Sci stack remains: HTF-bias cascade, dual market
+//            structure (protected swings/BOS), liquidity sweep+reclaim,
+//            institutional displacement, FVG, order blocks, kill zones,
+//            OTE, discount/premium, and the structural take-profit.
+//    (B) ADDED "Let Winners Run": a Sci runner that removes the fixed TP
+//        cap and rides a profitable trade with a profit-LOCK ratchet
+//        (+ optional protected-swing structure trail). Once armed, the
+//        stop sits in profit and only ratchets tighter (recomputed every
+//        bar and re-issued via strategy.exit), so the trade REMAINS OPEN
+//        AS LONG AS IT IS PROFITABLE and closes only when price retraces
+//        into the locked floor or an opposite ICC continuation flips
+//        structure (CloseOnOpposite). NOTHING in the SMC engine, ICC state
+//        machine, sizing, kill zones, OTE, FVG, OB, or structural-TP math
+//        changed.
+//
+//  v3.4.0 SCI FIDELITY (prior build) — 2026-08-12. Two ADDITIVE, opt-in
+//  modules that mirror the MQL5 EA 1:1 to keep both platforms in sync:
+//    (1) KILL-ZONE SESSIONS  : new group "Sci Kill-Zone Sessions"
+//        (useKZ + three configurable hour windows London / NY-AM / NY-PM).
+//        Gates EVERY entry path so orders fire only inside a Sci kill zone.
+//        Helpers f_inKZwin()/f_killzone(); midnight-wrap aware; timezone
+//        input maps the EA's broker-server hours onto the TradingView chart.
+//    (2) OTE ENTRY WINDOW    : new group "Sci OTE Entry Window"
+//        (useOTE, oteMin 0.62, oteMax 0.79). When ON, the ICC Correction
+//        must retrace into the 0.62-0.79 Optimal-Trade-Entry band before a
+//        Continuation fires; effMin/effMax replace the raw CorrRetrace
+//        bounds INSIDE the ICC engine only.
+//  Both toggles default OFF -> EXACT prior (v3.3.x) behaviour preserved.
+//  Version realigned to 3.4.0 to match the EA (drops the old +1 twin offset).
+//
+//  NOTE ON PLATFORM PARITY: Pine strategies cannot place live broker orders;
+//  they backtest and can fire alerts/webhooks. All ICC logic, gates,
+//  thresholds and defaults mirror the EA. Kill-zone hours are read in the
+//  configurable 'Kill-zone timezone' so you can line them up with the EA's
+//  broker-server clock.
+//  Built for Chad Woodyard, August 2026.
+// ==========================================================================
+strategy("ICC TradesBySci Strategy v3.9.0",
+     shorttitle       = "ICC-Sci v3.9.0",
+     overlay          = true,
+     pyramiding       = 0,
+     initial_capital  = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value= 100,
+     calc_on_every_tick = false,
+     process_orders_on_close = true)
+// ============================ INPUTS =====================================
+grpPaths = "=== Entry Path (Sci ICC only) ==="
+UseICCPullback    = input.bool(true,  "Sci Indication->Correction->Continuation pullback (the ONLY entry path)", group=grpPaths)
+CloseOnOpposite   = input.bool(true,  "Close open trade on an opposite ICC continuation (structure flip)",      group=grpPaths)
+grpBias = "=== Bias / Filter (Sci: HTF sets bias, LTF entry) ==="
+BiasLoose        = input.bool(true,  "Single BOS sets trend (HH w/o LL = bull)", group=grpBias)
+UseD1Filter      = input.bool(true,  "Let D1 influence HTF bias as a SOFT weight",group=grpBias)
+D1Weight         = input.float(0.5,  "D1 weight vs H4 (0=ignore .. >1 D1 dominates)", step=0.1, group=grpBias)
+HTF_MinConviction= input.float(0.5,  "Min net HTF score (same side as H4) to trade", step=0.1, group=grpBias)
+grpICC = "=== ICC Pullback Tuning ==="
+CorrRetraceMin = input.float(0.500, "Min pullback into discount/premium (fib)", step=0.01, group=grpICC)
+CorrRetraceMax = input.float(0.900, "Max pullback before invalidation (fib)",   step=0.01, group=grpICC)
+ICC_ExpiryBars = input.int(30, "Bars to complete Correction+Continuation, else reset", minval=1, group=grpICC)
+grpTF = "=== Timeframe Cascade (Sci D1->H4->H1->M15) ==="
+tfBias = input.timeframe("D",   "Top bias TF (D1)",         group=grpTF)
+tfMid  = input.timeframe("240", "Mid / Indication TF (H4)", group=grpTF)
+tfWork = input.timeframe("60",  "Working TF / swing anchor (H1)", group=grpTF)
+tfTrig = input.timeframe("15",  "Trigger TF / entry timing (M15)", group=grpTF)
+CascadeSwingLen = input.int(5, "Pivot length per-TF for cascade", minval=2, group=grpTF)
+grpSL = "=== Stop Loss / Sizing ==="
+ATR_Multiplier = input.float(1.5, "ATR multiplier", step=0.1, group=grpSL)
+ATR_Period     = input.int(14, "ATR period", minval=1, group=grpSL)
+SL_BufferPips  = input.float(5.0, "Extra structural SL buffer (pips)", step=0.5, group=grpSL)
+RR_Ratio       = input.float(2.0, "TP reward : risk (fixed-RR)", step=0.1, group=grpSL)
+grpTP = "=== Take-Profit Mode (v2.2 parity) ==="
+TPMode      = input.string("Fixed RR", "TP target", options=["Fixed RR","Structural"], group=grpTP)
+TPLookback  = input.int(200, "Structural: bars scanned for fallback swing target", minval=10, group=grpTP)
+TPMinRR     = input.float(1.0, "Structural: reject/floor targets below this RR", step=0.1, group=grpTP)
+// ==========================================================================
+//  v3.5.0 LET WINNERS RUN (Sci runner). When ON, the trade is opened with
+//  NO fixed take-profit (open-ended) and is ridden by a profit-LOCK ratchet:
+//  once unrealised profit reaches RunnerArmPips the stop is pulled into profit
+//  (break-even + RunnerLockPips) and thereafter only ever ratchets TIGHTER
+//  (trail behind peak by RunnerTrailPips and/or behind the last protected
+//  internal swing). Because the stop stays in profit after arming, the
+//  position REMAINS OPEN AS LONG AS IT IS PROFITABLE and closes only when
+//  price retraces into the locked floor or an opposite ICC continuation flips
+//  structure (CloseOnOpposite). Pip inputs mirror the EA's point inputs.
+// ==========================================================================
+grpRun = "=== Let Winners Run (Sci runner) ==="
+LetWinnersRun    = input.bool(true,  "Ride winners: no fixed TP; profit-lock ratchet keeps a profitable trade open", group=grpRun)
+RunnerArmPips    = input.float(20.0, "Profit (pips) before the profit-lock arms", step=0.5, group=grpRun)
+RunnerLockPips   = input.float(4.0,  "Profit (pips) locked in at arm (break-even + this)", step=0.5, group=grpRun)
+RunnerTrailPips  = input.float(15.0, "Trail behind peak by this many pips once armed (0 = structure-only trail)", step=0.5, group=grpRun)
+RunnerUseStruct  = input.bool(true,  "Also trail behind the last protected internal swing (structure trail)", group=grpRun)
+// ==========================================================================
+//  v3.6.0 EXIT ENGINE (R-multiple phased runner). Measures protection in R
+//  (1R = |avg entry - initial stop|) so it self-scales to each setup and to
+//  volatility (no arbitrary pips). When ON it SUPERSEDES the v3.5.0 Let-
+//  Winners-Run ratchet for the managed position. Stages: PROTECT at
+//  +protectAtR (break-even), LOCK at +lockAtR, ACTIVATE the STRUCTURE RUNNER
+//  at +activateAtR (structure-confirmed trailing + progressive give-back
+//  floor + wide ATR emergency floor). Master OFF = exact v3.5.0 management.
+// ==========================================================================
+grpRex = "=== Exit Engine v3.6 (R-multiple runner) ==="
+useRexit           = input.bool(true,  "MASTER: use the R-multiple phased exit engine (OFF = exact v3.5.0 runner)", group=grpRex)
+protectAtR         = input.float(1.0,  "+R to move the stop to break-even (Phase 2 protect)", step=0.1, group=grpRex)
+protectLockR       = input.float(0.0,  "R locked at protect (0 = pure break-even)", step=0.1, group=grpRex)
+lockAtR            = input.float(1.5,  "+R at which to lock meaningful profit (Phase 2b)", step=0.1, group=grpRex)
+lockProfitR        = input.float(0.5,  "R of profit locked from +lockAtR onward", step=0.1, group=grpRex)
+activateAtR        = input.float(2.0,  "+R to activate the STRUCTURE RUNNER (Phase 3)", step=0.1, group=grpRex)
+runnerGiveBackR    = input.float(2.0,  "Progressive floor beyond activation: lock (curR - this) in R", step=0.1, group=grpRex)
+runnerExternStruct = input.bool(true,  "Runner trails behind PROTECTED EXTERNAL structure (primary)", group=grpRex)
+runnerInternStruct = input.bool(true,  "Runner also trails behind protected INTERNAL structure (aggressive)", group=grpRex)
+runnerATRFloor     = input.bool(true,  "Keep a wide ATR emergency floor under the runner", group=grpRex)
+runnerATRfloorMult = input.float(3.0,  "ATR emergency-floor multiple (wide)", step=0.1, group=grpRex)
+usePartial         = input.bool(false, "Take an optional partial at +activateAtR (leave the rest running)", group=grpRex)
+partialPct         = input.float(25.0, "Percent of the position to close at the partial (0..100)", step=1, group=grpRex)
+useTrendHealth     = input.bool(true,  "Trend-health governor (HEALTHY hold / CAUTION tighten / REVERSAL exit)", group=grpRex)
+closeOnConfirmedRev= input.bool(true,  "Opposite ICC closes a runner ONLY with a confirmed external reversal", group=grpRex)
+// ---- SMC engine (structure / liquidity / displacement / FVG / OB) --------
+grpStruct = "=== SMC: Structure & Protected Swings ==="
+IntSwingStrength = input.int(2, "Internal swing fractal strength (entries)", minval=1, group=grpStruct)
+ExtSwingStrength = input.int(4, "External swing fractal strength (direction)", minval=1, group=grpStruct)
+BOSUseClose      = input.bool(true, "BOS requires a BODY close beyond the protected swing", group=grpStruct)
+ExtTrendControlsDir = input.bool(true, "External trend gates trade DIRECTION", group=grpStruct)
+IntTrendControlsEnt = input.bool(true, "Internal BOS gates the ENTRY (Indication)", group=grpStruct)
+grpLiq = "=== SMC: Liquidity Engine ==="
+RequireSweep   = input.bool(true, "Require a liquidity sweep + reclaim before Indication", group=grpLiq)
+LiqLookback    = input.int(120, "Bars scanned for liquidity pools", minval=10, group=grpLiq)
+RequireReclaim = input.bool(true, "Require price to RECLAIM the swept level", group=grpLiq)
+ReclaimBars    = input.int(3, "Bars allowed for the reclaim", minval=1, group=grpLiq)
+SweepValidBars = input.int(8, "Sweep arms an Indication for N bars", minval=1, group=grpLiq)
+SweepMinPips   = input.float(1.0, "Min penetration beyond the level (pips)", step=0.5, group=grpLiq)
+grpFVG = "=== SMC: Fair Value Gaps ==="
+RequireFVGpullback = input.bool(true, "Correction must pull back into an active FVG", group=grpFVG)
+DrawFVG         = input.bool(true, "Draw detected FVGs", group=grpFVG)
+MaxTrackedFVG   = input.int(40, "Max FVGs held in memory", minval=4, group=grpFVG)
+MinFVGPips      = input.float(1.0, "Min FVG size (pips)", step=0.5, group=grpFVG)
+grpDisp = "=== SMC: Institutional Displacement ==="
+RejectWeakBreaks = input.bool(true, "Reject Indication breaks below the score threshold", group=grpDisp)
+DispATRMult      = input.float(1.5, "Range >= ATR*mult scores full ATR points", step=0.1, group=grpDisp)
+DispMinBodyPct   = input.float(0.50, "Min body/range for a clean displacement", step=0.05, group=grpDisp)
+DispMinCloseStr  = input.float(0.60, "Min closing strength (close near the extreme)", step=0.05, group=grpDisp)
+DispMaxWickRatio = input.float(1.00, "Max opposing-wick/body ratio tolerated", step=0.1, group=grpDisp)
+DispMinScore     = input.float(60.0, "Reject displacements below this (0..100)", step=1, group=grpDisp)
+grpOB = "=== SMC: Order / Mitigation Blocks ==="
+UseOrderBlocks = input.bool(true, "Enable order-block detection & tracking", group=grpOB)
+RequireOB      = input.bool(false, "OB is CONFLUENCE, not a hard gate (default off)", group=grpOB)
+MaxTrackedOB   = input.int(40, "Max order blocks held in memory", minval=4, group=grpOB)
+DrawOB         = input.bool(true, "Draw order blocks", group=grpOB)
+grpRelax = "=== SMC: FVG Containment Relaxation (v3.3.9) ==="
+RelaxFVGContain   = input.bool(false, "Relax the continuation active-FVG containment test", group=grpRelax)
+FVGContainTolPips = input.float(5.0, "Containment tolerance (pips)", step=0.5, group=grpRelax)
+UseFVGband        = input.bool(true, "Also accept when the discount/premium BAND overlaps a gap", group=grpRelax)
+grpExit = "=== Exit Labels (v3.3.10) ==="
+ShowExitLabels    = input.bool(true, "Draw a label at each closed trade", group=grpExit)
+ExitLblShowProfit = input.bool(true, "Include net profit on the exit label", group=grpExit)
+ExitWinColor      = input.color(color.teal,   "Winning-exit label colour", group=grpExit)
+ExitLossColor     = input.color(color.maroon, "Losing-exit label colour",  group=grpExit)
+// ==========================================================================
+//  v3.4.0 SCI KILL-ZONE SESSIONS (opt-in). Restrict NEW entries to the
+//  ICT/Sci kill zones. Hours are read in 'Kill-zone timezone' so they can be
+//  aligned with the EA's broker-server clock. OFF (default) = all-hours flow.
+// ==========================================================================
+grpKZ = "=== Sci Kill-Zone Sessions (v3.4.0) ==="
+useKZ     = input.bool(false, "Gate ALL entries to Sci kill zones", group=grpKZ)
+kzTz      = input.string("GMT+3", "Kill-zone timezone (match your EA broker-server clock)", group=grpKZ)
+kzLon     = input.bool(true, "Enable London Open kill zone", group=grpKZ)
+lonStart  = input.int(7,  "London KZ start hour (0-23)", minval=0, maxval=23, group=grpKZ)
+lonEnd    = input.int(10, "London KZ end hour (0-23)",   minval=0, maxval=23, group=grpKZ)
+kzNYam    = input.bool(true, "Enable New York AM kill zone", group=grpKZ)
+nyamStart = input.int(12, "NY AM KZ start hour (0-23)", minval=0, maxval=23, group=grpKZ)
+nyamEnd   = input.int(15, "NY AM KZ end hour (0-23)",   minval=0, maxval=23, group=grpKZ)
+kzNYpm    = input.bool(true, "Enable New York PM kill zone", group=grpKZ)
+nypmStart = input.int(17, "NY PM KZ start hour (0-23)", minval=0, maxval=23, group=grpKZ)
+nypmEnd   = input.int(20, "NY PM KZ end hour (0-23)",   minval=0, maxval=23, group=grpKZ)
+// ==========================================================================
+//  v3.4.0 SCI OTE ENTRY WINDOW (opt-in). When ON, the ICC Correction must
+//  retrace into the 0.62-0.79 OTE band before a Continuation is allowed.
+//  OFF (default) = the raw CorrRetraceMin/Max band (exact prior behaviour).
+// ==========================================================================
+grpOTE = "=== Sci OTE Entry Window (v3.4.0) ==="
+useOTE = input.bool(false, "Require correction into the 0.62-0.79 OTE band", group=grpOTE)
+oteMin = input.float(0.62, "OTE shallow edge (min retrace of the impulse)", step=0.01, group=grpOTE)
+oteMax = input.float(0.79, "OTE deep edge (max retrace before invalidation)", step=0.01, group=grpOTE)
+grpDash = "=== Visuals ==="
+ShowDashboard = input.bool(true, "Show dashboard table", group=grpDash)
+
+// ============================ ML ENABLEMENT v3.7 =========================
+grpML = "=== ML Enablement v3.7 ==="
+mlMode = input.string("OFF", "ML mode", options=["OFF","OBSERVE","FILTER","FILTER+SIZE"], group=grpML)
+mlSource = input.string("SURROGATE", "Score source", options=["SURROGATE","MANUAL/EXTERNAL"], group=grpML)
+mlMinScore = input.float(0.70, "Minimum trade-quality probability", minval=0.0, maxval=1.0, step=0.01, group=grpML)
+mlManualP2 = input.float(0.75, "External probability: reach 2R", minval=0.0, maxval=1.0, step=0.01, group=grpML)
+mlManualP3 = input.float(0.60, "External probability: reach 3R", minval=0.0, maxval=1.0, step=0.01, group=grpML)
+mlManualP5 = input.float(0.35, "External probability: reach 5R", minval=0.0, maxval=1.0, step=0.01, group=grpML)
+mlManualP10= input.float(0.10, "External probability: reach 10R", minval=0.0, maxval=1.0, step=0.01, group=grpML)
+mlForecastDir = input.int(0, "External forecast direction (-1 short, 0 neutral, +1 long)", minval=-1, maxval=1, group=grpML)
+mlForecastStrength = input.float(0.0, "External forecast strength (ATR units)", minval=0.0, step=0.1, group=grpML)
+mlRequireForecast = input.bool(false, "Require forecast agreement with ICC direction", group=grpML)
+mlRunnerMinP3 = input.float(0.55, "Use open-ended runner when P(3R) >=", minval=0.0, maxval=1.0, step=0.01, group=grpML)
+mlLowMult = input.float(0.50, "Sizing multiplier below 70%", minval=0.0, step=0.05, group=grpML)
+mlBaseMult= input.float(1.00, "Sizing multiplier from 70% to 84%", minval=0.0, step=0.05, group=grpML)
+mlHighMult= input.float(2.00, "Sizing multiplier at 85%+", minval=0.0, step=0.05, group=grpML)
+mlBaseEquityPct = input.float(100.0, "Pine approximate base equity % for ML sizing", minval=0.1, step=0.1, group=grpML)
+mlExportJSON = input.bool(true, "Emit JSON feature payload on each raw ICC signal", group=grpML)
+mlEmitStartup = input.bool(true, "Emit one-time startup verification payload (pipeline test)", group=grpML)
+mlEmitTradeJSON = input.bool(true, "Emit JSON trade payload on each closed trade (icc_ml_v2 true 2R label)", group=grpML)
+// ============================ HELPERS ====================================
+// Pip size mirrors the EA: fractional-FX / metals scale point*10.
+isMetalSym = str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "XAG") or str.contains(syminfo.ticker, "GOLD") or str.contains(syminfo.ticker, "SILVER")
+pip = syminfo.mintick * (((syminfo.mintick == 0.00001 or syminfo.mintick == 0.001) or isMetalSym) ? 10.0 : 1.0)
+atrVal    = ta.atr(ATR_Period)
+fvgMin    = MinFVGPips  * pip
+sweepMin  = SweepMinPips * pip
+slBuf     = SL_BufferPips * pip
+fvgTol    = FVGContainTolPips * pip
+// ---- Multi-TF bias (Sci cascade). f_bias() runs inside each security ctx.
+f_bias() =>
+    ph = ta.pivothigh(CascadeSwingLen, CascadeSwingLen)
+    pl = ta.pivotlow(CascadeSwingLen, CascadeSwingLen)
+    var float lastHi = na
+    var float prevHi = na
+    var float lastLo = na
+    var float prevLo = na
+    if not na(ph)
+        prevHi := lastHi
+        lastHi := ph
+    if not na(pl)
+        prevLo := lastLo
+        lastLo := pl
+    hh = not na(lastHi) and not na(prevHi) and lastHi > prevHi
+    hl = not na(lastLo) and not na(prevLo) and lastLo > prevLo
+    lh = not na(lastHi) and not na(prevHi) and lastHi < prevHi
+    ll = not na(lastLo) and not na(prevLo) and lastLo < prevLo
+    b = 0
+    if BiasLoose
+        b := hh and not ll ? 1 : ll and not hh ? -1 : 0
+    else
+        b := hh and hl ? 1 : lh and ll ? -1 : 0
+    b
+biasD1  = request.security(syminfo.tickerid, tfBias, f_bias(), lookahead=barmerge.lookahead_off)
+biasH4  = request.security(syminfo.tickerid, tfMid,  f_bias(), lookahead=barmerge.lookahead_off)
+biasH1  = request.security(syminfo.tickerid, tfWork, f_bias(), lookahead=barmerge.lookahead_off)
+biasM15 = request.security(syminfo.tickerid, tfTrig, f_bias(), lookahead=barmerge.lookahead_off)
+// v2.1 soft-D1 HTF weight: H4 leads, D1 nudges conviction.
+htfScore = UseD1Filter ? biasH4 + biasD1 * D1Weight : biasH4
+htfBias  = biasH4 == 0 ? 0 : (not UseD1Filter ? biasH4 : (biasH4 == 1 and htfScore >= HTF_MinConviction ? 1 : biasH4 == -1 and htfScore <= -HTF_MinConviction ? -1 : 0))
+// v3.5.0: loose LTF alignment retained ONLY as a dashboard readout (the v1
+// lockstep StrictAlign gate and the breakout path it fed were removed).
+alignBull = biasH1==1 and biasM15==1
+alignBear = biasH1==-1 and biasM15==-1
+// ---- WorkTF / TrigTF prices (last closed) via security -------------------
+wkH1  = request.security(syminfo.tickerid, tfWork, high[1], lookahead=barmerge.lookahead_off)
+wkL1  = request.security(syminfo.tickerid, tfWork, low[1],  lookahead=barmerge.lookahead_off)
+m15c1 = request.security(syminfo.tickerid, tfTrig, close[1],lookahead=barmerge.lookahead_off)
+m15h2 = request.security(syminfo.tickerid, tfTrig, high[2], lookahead=barmerge.lookahead_off)
+m15l2 = request.security(syminfo.tickerid, tfTrig, low[2],  lookahead=barmerge.lookahead_off)
+// ============================ SMC STRUCTURE ==============================
+// Protected swings on the chart (structure) TF: external gates DIRECTION,
+// internal feeds the ICC break anchors (BOS-on-protected).
+eph = ta.pivothigh(ExtSwingStrength, ExtSwingStrength)
+epl = ta.pivotlow(ExtSwingStrength, ExtSwingStrength)
+var float extProtHigh = na
+var float extProtLow  = na
+var int   extTrend    = 0
+if not na(eph)
+    extProtHigh := eph
+if not na(epl)
+    extProtLow := epl
+bH = BOSUseClose ? close[1] : high[1]
+bL = BOSUseClose ? close[1] : low[1]
+if not na(extProtHigh) and bH > extProtHigh
+    extTrend := 1
+else if not na(extProtLow) and bL < extProtLow
+    extTrend := -1
+iph = ta.pivothigh(IntSwingStrength, IntSwingStrength)
+ipl = ta.pivotlow(IntSwingStrength, IntSwingStrength)
+var float intProtHigh = na
+var float intProtLow  = na
+if not na(iph)
+    intProtHigh := iph
+if not na(ipl)
+    intProtLow := ipl
+// v3.6.0: internal-structure trend (BOS on protected internal swings), the
+// Pine mirror of the EA's g_intTrend. Feeds the trend-health governor:
+// external flip = REVERSAL exit, internal-only flip = CAUTION tighten.
+var int intTrend = 0
+biH = BOSUseClose ? close[1] : high[1]
+biL = BOSUseClose ? close[1] : low[1]
+if not na(intProtHigh) and biH > intProtHigh
+    intTrend := 1
+else if not na(intProtLow) and biL < intProtLow
+    intTrend := -1
+// Feed protected internal swings to the ICC anchors (like EA MSE_Update).
+wkLastHi = IntTrendControlsEnt and not na(intProtHigh) ? intProtHigh : intProtHigh
+wkLastLo = IntTrendControlsEnt and not na(intProtLow)  ? intProtLow  : intProtLow
+// ============================ LIQUIDITY ENGINE ===========================
+// BSL/SSL pools + sweep + reclaim, with armed-window countdowns (EA parity).
+bsl = ta.highest(high, LiqLookback)[1]
+ssl = ta.lowest(low,  LiqLookback)[1]
+var int sweepConfLong  = 0
+var int sweepConfShort = 0
+var float lastSweepLvl = na
+if sweepConfLong  > 0
+    sweepConfLong  := sweepConfLong  - 1
+if sweepConfShort > 0
+    sweepConfShort := sweepConfShort - 1
+// Sell-side sweep (raid of lows -> look LONG)
+sweptLong  = not na(ssl) and (low[1]  < ssl - sweepMin) and (close[1] > ssl)
+// Buy-side sweep (raid of highs -> look SHORT)
+sweptShort = not na(bsl) and (high[1] > bsl + sweepMin) and (close[1] < bsl)
+f_reclaimUp(lvl) =>
+    ok = not RequireReclaim
+    if RequireReclaim
+        for s = 1 to ReclaimBars
+            if close[s] > lvl
+                ok := true
+    ok
+f_reclaimDn(lvl) =>
+    ok = not RequireReclaim
+    if RequireReclaim
+        for s = 1 to ReclaimBars
+            if close[s] < lvl
+                ok := true
+    ok
+if sweptLong and f_reclaimUp(ssl)
+    sweepConfLong := SweepValidBars
+    lastSweepLvl := ssl
+else if sweptShort and f_reclaimDn(bsl)
+    sweepConfShort := SweepValidBars
+    lastSweepLvl := bsl
+liqStatus = sweepConfLong > 0 ? "long armed (" + str.tostring(sweepConfLong) + ")" : sweepConfShort > 0 ? "short armed (" + str.tostring(sweepConfShort) + ")" : "watching pools"
+// ============================ DISPLACEMENT ===============================
+// Blend ATR / body% / close-strength / opposing-wick into a 0..100 score.
+f_disp(dir) =>
+    o = open[1]
+    c = close[1]
+    h = high[1]
+    l = low[1]
+    rng = h - l
+    score = 0.0
+    if rng > 0.0
+        dirOk = dir == 1 ? c > o : c < o
+        if dirOk
+            body     = math.abs(c - o)
+            bodyPct  = body / rng
+            closeStr = dir == 1 ? (c - l) / rng : (h - c) / rng
+            oppWick  = dir == 1 ? (h - c) : (c - l)
+            wickRat  = body > 0.0 ? oppWick / body : 999.0
+            atrFac   = atrVal > 0.0 ? rng / atrVal : 0.0
+            sBody  = math.min(bodyPct  / math.max(DispMinBodyPct, 0.01), 1.0) * 30.0
+            sClose = math.min(closeStr / math.max(DispMinCloseStr,0.01), 1.0) * 25.0
+            sWick  = math.min(DispMaxWickRatio / math.max(wickRat, 0.0001), 1.0) * 15.0
+            sATR   = math.min(atrFac  / math.max(DispATRMult,    0.01), 1.0) * 30.0
+            score := math.min(sBody + sClose + sWick + sATR, 100.0)
+    score
+var float lastDispScore = 0.0
+// ============================ FAIR VALUE GAPS ============================
+var array<float> fvgTop    = array.new_float()
+var array<float> fvgBot    = array.new_float()
+var array<int>   fvgDir    = array.new_int()
+var array<bool>  fvgActive = array.new_bool()
+var array<box>   fvgBox    = array.new_box()
+f_pushFVG(t, b, d) =>
+    array.push(fvgTop, t)
+    array.push(fvgBot, b)
+    array.push(fvgDir, d)
+    array.push(fvgActive, true)
+    bx = DrawFVG ? box.new(bar_index-2, t, bar_index, b, border_color=na, bgcolor=color.new(d==1?color.teal:color.maroon, 80)) : na
+    array.push(fvgBox, bx)
+    if array.size(fvgTop) > MaxTrackedFVG
+        obx = array.shift(fvgBox)
+        if not na(obx)
+            box.delete(obx)
+        array.shift(fvgTop)
+        array.shift(fvgBot)
+        array.shift(fvgDir)
+        array.shift(fvgActive)
+// Bullish FVG: low[1] > high[3] (gap across candle [2]); bearish mirror.
+bullFVG = low[1]  - high[3] >= fvgMin
+bearFVG = low[3]  - high[1] >= fvgMin
+if bullFVG
+    f_pushFVG(low[1], high[3], 1)
+if bearFVG
+    f_pushFVG(low[3], high[1], -1)
+// Invalidate fully-filled gaps; extend active boxes to the right.
+if array.size(fvgActive) > 0
+    for i = 0 to array.size(fvgActive) - 1
+        if array.get(fvgActive, i)
+            t = array.get(fvgTop, i)
+            b = array.get(fvgBot, i)
+            d = array.get(fvgDir, i)
+            if d == 1 and low[1] < b
+                array.set(fvgActive, i, false)
+            if d == -1 and high[1] > t
+                array.set(fvgActive, i, false)
+            if DrawFVG
+                bx = array.get(fvgBox, i)
+                if not na(bx)
+                    if array.get(fvgActive, i)
+                        box.set_right(bx, bar_index)
+                    else
+                        box.delete(bx)
+f_inActiveFVG(dir, price) =>
+    res = false
+    if array.size(fvgActive) > 0
+        for i = 0 to array.size(fvgActive) - 1
+            if array.get(fvgActive, i) and array.get(fvgDir, i) == dir
+                if price <= array.get(fvgTop, i) and price >= array.get(fvgBot, i)
+                    res := true
+    res
+f_inActiveFVGtol(dir, price, tol) =>
+    res = false
+    if array.size(fvgActive) > 0
+        for i = 0 to array.size(fvgActive) - 1
+            if array.get(fvgActive, i) and array.get(fvgDir, i) == dir
+                if price <= array.get(fvgTop, i) + tol and price >= array.get(fvgBot, i) - tol
+                    res := true
+    res
+f_bandOverlapsFVG(dir, lo, hi) =>
+    res = false
+    if array.size(fvgActive) > 0
+        for i = 0 to array.size(fvgActive) - 1
+            if array.get(fvgActive, i) and array.get(fvgDir, i) == dir
+                if lo <= array.get(fvgTop, i) and hi >= array.get(fvgBot, i)
+                    res := true
+    res
+// Unified continuation FVG-containment gate (v3.3.9 relax parity).
+f_fvgContainOK(dir, price, bandFrom) =>
+    ok = f_inActiveFVG(dir, price)
+    if not ok and RelaxFVGContain
+        if f_inActiveFVGtol(dir, price, fvgTol)
+            ok := true
+        else if UseFVGband
+            lo = math.min(price, bandFrom)
+            hi = math.max(price, bandFrom)
+            if f_bandOverlapsFVG(dir, lo, hi)
+                ok := true
+    ok
+// ============================ ORDER BLOCKS ===============================
+var array<float> obTop    = array.new_float()
+var array<float> obBot    = array.new_float()
+var array<int>   obDir    = array.new_int()
+var array<bool>  obActive = array.new_bool()
+var array<box>   obBox    = array.new_box()
+f_pushOB(t, b, d) =>
+    array.push(obTop, t)
+    array.push(obBot, b)
+    array.push(obDir, d)
+    array.push(obActive, true)
+    bx = DrawOB ? box.new(bar_index-1, t, bar_index, b, border_color=(d==1?color.green:color.red), bgcolor=na) : na
+    array.push(obBox, bx)
+    if array.size(obTop) > MaxTrackedOB
+        obx = array.shift(obBox)
+        if not na(obx)
+            box.delete(obx)
+        array.shift(obTop)
+        array.shift(obBot)
+        array.shift(obDir)
+        array.shift(obActive)
+// Bullish OB = last down-close candle before an up displacement (approx).
+if UseOrderBlocks
+    if f_disp(1) >= DispMinScore and close[2] < open[2]
+        f_pushOB(high[2], low[2], 1)
+    if f_disp(-1) >= DispMinScore and close[2] > open[2]
+        f_pushOB(high[2], low[2], -1)
+if array.size(obActive) > 0
+    for i = 0 to array.size(obActive) - 1
+        if array.get(obActive, i)
+            d = array.get(obDir, i)
+            t = array.get(obTop, i)
+            b = array.get(obBot, i)
+            thru = close[1]
+            if d == 1 and thru < b
+                array.set(obActive, i, false)
+            if d == -1 and thru > t
+                array.set(obActive, i, false)
+            if DrawOB
+                bx = array.get(obBox, i)
+                if not na(bx)
+                    if array.get(obActive, i)
+                        box.set_right(bx, bar_index)
+                    else
+                        box.delete(bx)
+f_inActiveOB(dir, price) =>
+    res = false
+    if array.size(obActive) > 0
+        for i = 0 to array.size(obActive) - 1
+            if array.get(obActive, i) and array.get(obDir, i) == dir
+                if price <= array.get(obTop, i) and price >= array.get(obBot, i)
+                    res := true
+    res
+// ==========================================================================
+//  ICC PULLBACK ENGINE  (Indication -> Correction -> Continuation)
+//  v3.4.0: effMin/effMax fold in the OTE window when useOTE is ON.
+// ==========================================================================
+var int   iccPhase    = 0   // 0 none / 1 indication / 2 correction
+var int   iccDir      = 0
+var float indLevel    = 0.0
+var float indExtreme  = 0.0
+var float corrExtreme = 0.0
+var int   iccStartBar = 0
+var bool  iccBuySig   = false
+var bool  iccSellSig  = false
+var float iccSigSL    = 0.0
+var float mlSigOTEDepth = na
+// v3.4.0 OTE window replaces the raw CorrRetrace bounds inside ICC only.
+effMin = useOTE ? oteMin : CorrRetraceMin
+effMax = useOTE ? oteMax : CorrRetraceMax
+iccBuySig  := false
+iccSellSig := false
+iccSigSL   := 0.0
+mlSigOTEDepth := na
+dataOK = UseICCPullback and not na(m15c1) and not na(wkH1) and not na(wkL1) and m15c1 > 0 and wkH1 > 0 and wkL1 > 0
+if dataOK
+    // Bias flip cancels an in-progress setup facing the wrong way
+    if iccPhase != 0 and iccDir != 0 and htfBias != 0 and htfBias != iccDir
+        iccPhase := 0
+        iccDir := 0
+        indLevel := 0.0
+        indExtreme := 0.0
+        corrExtreme := 0.0
+        iccStartBar := 0
+    // Expiry
+    if iccPhase != 0 and (bar_index - iccStartBar) > ICC_ExpiryBars
+        iccPhase := 0
+        iccDir := 0
+        indLevel := 0.0
+        indExtreme := 0.0
+        corrExtreme := 0.0
+        iccStartBar := 0
+    // ==================== BULLISH branch ====================
+    if htfBias == 1
+        if iccPhase == 0
+            extOK   = (not ExtTrendControlsDir) or extTrend >= 0
+            sweepOK = (not RequireSweep) or sweepConfLong > 0
+            dispSc  = RejectWeakBreaks ? f_disp(1) : 100.0
+            dispOK  = (not RejectWeakBreaks) or dispSc >= DispMinScore
+            if RejectWeakBreaks
+                lastDispScore := dispSc
+            if not na(wkLastHi) and wkLastHi > 0 and m15c1 > wkLastHi and extOK and sweepOK and dispOK
+                iccPhase    := 1
+                iccDir      := 1
+                indLevel    := wkLastHi
+                indExtreme  := math.max(wkH1, m15c1)
+                corrExtreme := wkL1
+                iccStartBar := bar_index
+        else if iccPhase == 1 and iccDir == 1
+            if wkH1 > indExtreme
+                indExtreme := wkH1
+            leg = indExtreme - indLevel
+            if leg > 0
+                disc  = indExtreme - leg * effMin
+                inval = indExtreme - leg * effMax
+                if wkL1 <= inval
+                    iccPhase := 0
+                    iccDir := 0
+                    indLevel := 0.0
+                    indExtreme := 0.0
+                    corrExtreme := 0.0
+                    iccStartBar := 0
+                else if wkL1 <= disc
+                    iccPhase    := 2
+                    corrExtreme := wkL1
+        else if iccPhase == 2 and iccDir == 1
+            if wkL1 < corrExtreme
+                corrExtreme := wkL1
+            leg   = indExtreme - indLevel
+            inval = leg > 0 ? indExtreme - leg * effMax : 0.0
+            disc  = leg > 0 ? indExtreme - leg * effMin : corrExtreme
+            if leg > 0 and wkL1 <= inval
+                iccPhase := 0
+                iccDir := 0
+                indLevel := 0.0
+                indExtreme := 0.0
+                corrExtreme := 0.0
+                iccStartBar := 0
+            else
+                fvgOK = (not RequireFVGpullback) or f_fvgContainOK(1, corrExtreme, disc)
+                obOK  = (not RequireOB) or (not UseOrderBlocks) or f_inActiveOB(1, corrExtreme)
+                if not na(m15h2) and m15h2 > 0 and m15c1 > m15h2 and fvgOK and obOK
+                    iccBuySig := true
+                    iccSigSL  := corrExtreme - slBuf
+                    mlSigOTEDepth := leg > 0 ? (indExtreme - corrExtreme) / leg : na
+                    iccPhase := 0
+                    iccDir := 0
+                    indLevel := 0.0
+                    indExtreme := 0.0
+                    corrExtreme := 0.0
+                    iccStartBar := 0
+    // ==================== BEARISH branch ====================
+    else if htfBias == -1
+        if iccPhase == 0
+            extOK   = (not ExtTrendControlsDir) or extTrend <= 0
+            sweepOK = (not RequireSweep) or sweepConfShort > 0
+            dispSc  = RejectWeakBreaks ? f_disp(-1) : 100.0
+            dispOK  = (not RejectWeakBreaks) or dispSc >= DispMinScore
+            if RejectWeakBreaks
+                lastDispScore := dispSc
+            if not na(wkLastLo) and wkLastLo > 0 and m15c1 < wkLastLo and extOK and sweepOK and dispOK
+                iccPhase    := 1
+                iccDir      := -1
+                indLevel    := wkLastLo
+                indExtreme  := math.min(wkL1, m15c1)
+                corrExtreme := wkH1
+                iccStartBar := bar_index
+        else if iccPhase == 1 and iccDir == -1
+            if wkL1 < indExtreme
+                indExtreme := wkL1
+            leg = indLevel - indExtreme
+            if leg > 0
+                prem  = indExtreme + leg * effMin
+                inval = indExtreme + leg * effMax
+                if wkH1 >= inval
+                    iccPhase := 0
+                    iccDir := 0
+                    indLevel := 0.0
+                    indExtreme := 0.0
+                    corrExtreme := 0.0
+                    iccStartBar := 0
+                else if wkH1 >= prem
+                    iccPhase    := 2
+                    corrExtreme := wkH1
+        else if iccPhase == 2 and iccDir == -1
+            if wkH1 > corrExtreme
+                corrExtreme := wkH1
+            leg   = indLevel - indExtreme
+            inval = leg > 0 ? indExtreme + leg * effMax : 0.0
+            prem  = leg > 0 ? indExtreme + leg * effMin : corrExtreme
+            if leg > 0 and wkH1 >= inval
+                iccPhase := 0
+                iccDir := 0
+                indLevel := 0.0
+                indExtreme := 0.0
+                corrExtreme := 0.0
+                iccStartBar := 0
+            else
+                fvgOK = (not RequireFVGpullback) or f_fvgContainOK(-1, corrExtreme, prem)
+                obOK  = (not RequireOB) or (not UseOrderBlocks) or f_inActiveOB(-1, corrExtreme)
+                if not na(m15l2) and m15l2 > 0 and m15c1 < m15l2 and fvgOK and obOK
+                    iccSellSig := true
+                    iccSigSL   := corrExtreme + slBuf
+                    mlSigOTEDepth := leg > 0 ? (corrExtreme - indExtreme) / leg : na
+                    iccPhase := 0
+                    iccDir := 0
+                    indLevel := 0.0
+                    indExtreme := 0.0
+                    corrExtreme := 0.0
+                    iccStartBar := 0
+    else
+        if iccPhase == 0
+            iccPhase := 0
+            iccDir := 0
+            indLevel := 0.0
+            indExtreme := 0.0
+            corrExtreme := 0.0
+            iccStartBar := 0
+// v3.5.0: the light S/R RETEST-confirmation path and the v1 CASCADE breakout
+// path were removed (mirror of the EA cleanup). The genuine Sci ICC pullback
+// is now the ONLY entry path; there are no retestBuySig/retestSellSig or
+// cascBuy/cascSell signals any more.
+// ==========================================================================
+//  v3.4.0 SCI KILL-ZONE GATE. A window may wrap midnight (start>end).
+// ==========================================================================
+f_inKZwin(h, s, e) =>
+    s < e ? (h >= s and h < e) : (h >= s or h < e)
+kzHour   = hour(time, kzTz)
+inLon    = kzLon  and f_inKZwin(kzHour, lonStart,  lonEnd)
+inNYam   = kzNYam and f_inKZwin(kzHour, nyamStart, nyamEnd)
+inNYpm   = kzNYpm and f_inKZwin(kzHour, nypmStart, nypmEnd)
+inKZ     = not useKZ ? true : (inLon or inNYam or inNYpm)
+kzActive = not useKZ ? "OFF" : inLon ? "London" : inNYam ? "NY-AM" : inNYpm ? "NY-PM" : "outside"
+
+// v3.8.0: nearest active same-direction FVG to the signal price.
+f_mlFVG(dir, price) =>
+    float mid = na
+    float size = na
+    float best = 1e18
+    if array.size(fvgActive) > 0
+        for i = 0 to array.size(fvgActive) - 1
+            if array.get(fvgActive, i) and array.get(fvgDir, i) == dir
+                t = array.get(fvgTop, i)
+                b = array.get(fvgBot, i)
+                m = (t + b) / 2.0
+                d = math.abs(price - m)
+                if d < best
+                    best := d
+                    mid := m
+                    size := t - b
+    [mid, size]
+// ============================ ML FEATURE/DECISION LAYER ==================
+f_countTrue(array<bool> a) =>
+    n = 0
+    if array.size(a) > 0
+        for i = 0 to array.size(a) - 1
+            if array.get(a, i)
+                n += 1
+    n
+activeFVG = f_countTrue(fvgActive)
+activeOB  = f_countTrue(obActive)
+atrBase = ta.sma(atrVal, 50)
+regimeTrend = math.abs(ta.ema(close, 20) - ta.ema(close, 50)) / math.max(atrVal, syminfo.mintick)
+regimeVol = atrBase > 0 ? atrVal / atrBase : 1.0
+regimeCode = regimeTrend >= 1.0 ? (regimeVol >= 1.15 ? 3 : 2) : (regimeVol >= 1.15 ? 1 : 0)
+regimeTxt = regimeCode == 3 ? "TREND+EXP" : regimeCode == 2 ? "TREND" : regimeCode == 1 ? "RANGE+HIGHVOL" : "RANGE"
+sessionCode = inLon ? 1 : inNYam ? 2 : inNYpm ? 3 : 0
+f_mlSurrogate(dir) =>
+    biasPart = htfBias == dir ? 0.18 : 0.0
+    extPart = extTrend == dir ? 0.14 : extTrend == 0 ? 0.06 : 0.0
+    intPart = intTrend == dir ? 0.10 : intTrend == 0 ? 0.04 : 0.0
+    liqPart = dir == 1 ? (sweepConfLong > 0 ? 0.14 : 0.0) : (sweepConfShort > 0 ? 0.14 : 0.0)
+    dispPart = math.min(lastDispScore / 100.0, 1.0) * 0.18
+    fvgPart = activeFVG > 0 ? 0.08 : 0.0
+    obPart = activeOB > 0 ? 0.05 : 0.0
+    otePart = useOTE ? 0.07 : 0.03
+    sessPart = sessionCode > 0 ? 0.04 : 0.01
+    regPart = regimeCode >= 2 ? 0.02 : 0.0
+    math.min(0.05 + biasPart + extPart + intPart + liqPart + dispPart + fvgPart + obPart + otePart + sessPart + regPart, 0.99)
+rawDir = iccBuySig ? 1 : iccSellSig ? -1 : 0
+[mlFVGMid, mlFVGSize] = f_mlFVG(rawDir, close)
+mlFVGMidDist = rawDir != 0 and not na(mlFVGMid) ? math.abs(close - mlFVGMid) : na
+mlFVGMidDistATR = not na(mlFVGMidDist) and atrVal > 0 ? mlFVGMidDist / atrVal : na
+mlFVGSizeATR = not na(mlFVGSize) and atrVal > 0 ? mlFVGSize / atrVal : na
+mlRiskDistance = rawDir != 0 and iccSigSL > 0 ? math.abs(close - iccSigSL) : na
+mlRiskDistanceATR = not na(mlRiskDistance) and atrVal > 0 ? mlRiskDistance / atrVal : na
+mlRiskDistancePips = not na(mlRiskDistance) and pip > 0 ? mlRiskDistance / pip : na
+mlSpreadPrice = syminfo.mintick
+mlSpreadTicks = 1.0
+mlHour = hour(time, kzTz)
+mlMinute = minute(time, kzTz)
+mlMinuteOfDay = mlHour * 60 + mlMinute
+mlTimeSin = math.sin(2.0 * math.pi * mlMinuteOfDay / 1440.0)
+mlTimeCos = math.cos(2.0 * math.pi * mlMinuteOfDay / 1440.0)
+mlSymbol = syminfo.tickerid
+mlSurrogate = rawDir != 0 ? f_mlSurrogate(rawDir) : 0.0
+mlP2 = mlSource == "MANUAL/EXTERNAL" ? mlManualP2 : mlSurrogate
+mlP3 = mlSource == "MANUAL/EXTERNAL" ? mlManualP3 : math.max(0.0, mlP2 - 0.15)
+mlP5 = mlSource == "MANUAL/EXTERNAL" ? mlManualP5 : math.max(0.0, mlP2 - 0.38)
+mlP10= mlSource == "MANUAL/EXTERNAL" ? mlManualP10: math.max(0.0, mlP2 - 0.63)
+forecastAgree = rawDir == 0 or not mlRequireForecast or mlForecastDir == 0 or mlForecastDir == rawDir
+mlPass = mlMode == "OFF" or mlMode == "OBSERVE" or (mlP2 >= mlMinScore and forecastAgree)
+mlRiskMult = mlP2 >= 0.85 ? mlHighMult : mlP2 >= 0.70 ? mlBaseMult : mlLowMult
+mlRunnerOK = mlMode == "OFF" or mlMode == "OBSERVE" or mlP3 >= mlRunnerMinP3
+mlStatus = mlMode == "OFF" ? "OFF" : mlPass ? "PASS" : "BLOCK"
+mlPayload = '{"schema":"icc_ml_v1","symbol":"' + syminfo.ticker + '","time":' + str.tostring(time) + ',"dir":' + str.tostring(rawDir) + ',"htf_score":' + str.tostring(htfScore) + ',"ext_trend":' + str.tostring(extTrend) + ',"int_trend":' + str.tostring(intTrend) + ',"sweep_long":' + str.tostring(sweepConfLong) + ',"sweep_short":' + str.tostring(sweepConfShort) + ',"disp":' + str.tostring(lastDispScore) + ',"fvg_active":' + str.tostring(activeFVG) + ',"ob_active":' + str.tostring(activeOB) + ',"atr":' + str.tostring(atrVal) + ',"session":' + str.tostring(sessionCode) + ',"regime":' + str.tostring(regimeCode) + ',"p2":' + str.tostring(mlP2) + ',"p3":' + str.tostring(mlP3) + ',"p5":' + str.tostring(mlP5) + ',"p10":' + str.tostring(mlP10) + ',"forecast_dir":' + str.tostring(mlForecastDir) + ',"forecast_atr":' + str.tostring(mlForecastStrength) + ',"fvg_mid_dist":' + str.tostring(mlFVGMidDist) + ',"fvg_mid_dist_atr":' + str.tostring(mlFVGMidDistATR) + ',"ote_depth":' + str.tostring(mlSigOTEDepth) + ',"fvg_size_atr":' + str.tostring(mlFVGSizeATR) + ',"risk_distance":' + str.tostring(mlRiskDistance) + ',"risk_distance_atr":' + str.tostring(mlRiskDistanceATR) + ',"risk_distance_pips":' + str.tostring(mlRiskDistancePips) + ',"spread_price_proxy":' + str.tostring(mlSpreadPrice) + ',"spread_ticks_proxy":' + str.tostring(mlSpreadTicks) + ',"hour":' + str.tostring(mlHour) + ',"minute_of_day":' + str.tostring(mlMinuteOfDay) + ',"time_sin":' + str.tostring(mlTimeSin) + ',"time_cos":' + str.tostring(mlTimeCos) + ',"symbol_id":"' + mlSymbol + '","schema_version":"icc_ml_v1","payload_type":"signal"}'
+if mlExportJSON and rawDir != 0
+    alert(mlPayload, alert.freq_once_per_bar_close)
+// ---------------------------------------------------------------------------
+// v3.8.1 STARTUP VERIFICATION PAYLOAD
+// Fires exactly once, on the first confirmed bar of the script, so you can
+// prove the alert()/webhook path works even when zero ICC signals occur.
+// This is the Pine analogue of the EA v3.8.1 "write CSV header at OnInit".
+// It carries no trade signal (dir=0, payload_type="startup").
+// ---------------------------------------------------------------------------
+var bool mlStartupSent = false
+if mlEmitStartup and not mlStartupSent and barstate.isconfirmed
+    startupPayload = '{"schema":"icc_ml_v1","schema_version":"icc_ml_v1","payload_type":"startup","symbol":"' + syminfo.ticker + '","symbol_id":"' + syminfo.tickerid + '","time":' + str.tostring(time) + ',"ml_mode":"' + mlMode + '","ml_source":"' + mlSource + '","export_json":' + str.tostring(mlExportJSON) + ',"timeframe":"' + timeframe.period + '","note":"pipeline verification - no ICC signal"}'
+    alert(startupPayload, alert.freq_once_per_bar_close)
+    mlStartupSent := true
+plot(mlP2, "ML P(2R)", display=display.data_window)
+plot(mlP3, "ML P(3R)", display=display.data_window)
+plot(mlP5, "ML P(5R)", display=display.data_window)
+plot(mlP10,"ML P(10R)", display=display.data_window)
+plot(regimeCode, "ML regime code", display=display.data_window)
+plot(sessionCode, "ML session code", display=display.data_window)
+plot(mlFVGMidDistATR, "ML FVG midpoint distance ATR", display=display.data_window)
+plot(mlSigOTEDepth, "ML OTE depth", display=display.data_window)
+plot(mlFVGSizeATR, "ML FVG size ATR", display=display.data_window)
+plot(mlRiskDistanceATR, "ML risk distance ATR", display=display.data_window)
+plot(mlRiskDistancePips, "ML risk distance pips", display=display.data_window)
+plot(mlSpreadTicks, "ML spread ticks proxy", display=display.data_window)
+plot(mlMinuteOfDay, "ML minute of day", display=display.data_window)
+plot(mlTimeSin, "ML time sin", display=display.data_window)
+plot(mlTimeCos, "ML time cos", display=display.data_window)
+// ============================ SIGNAL ROUTING =============================
+// v3.5.0: the ONLY entry signal is the Sci ICC continuation.
+buySig  = iccBuySig
+sellSig = iccSellSig
+// Kill-zone gate blocks the ICC entry (EA parity).
+canEnter = (not useKZ) or inKZ
+curPos = strategy.position_size
+// v3.6.0: an opposite ICC ALONE no longer ejects a runner. When
+// closeOnConfirmedRev is ON the close also requires a CONFIRMED external
+// reversal (external BOS against the position); the R-engine's trend-health
+// governor is the primary reversal exit.
+extRevLong  = extTrend == -1
+extRevShort = extTrend == 1
+if CloseOnOpposite and curPos > 0 and sellSig and ((not useRexit) or (not closeOnConfirmedRev) or extRevLong)
+    strategy.close("LONG", comment="EXIT LONG")
+if CloseOnOpposite and curPos < 0 and buySig and ((not useRexit) or (not closeOnConfirmedRev) or extRevShort)
+    strategy.close("SHORT", comment="EXIT SHORT")
+// ---- Structural / RR take-profit + SL resolution ------------------------
+f_structTP(dir, entryPx) =>
+    best = 0.0
+    if dir > 0
+        hh = ta.highest(high, TPLookback)[1]
+        best := (not na(hh) and hh > entryPx) ? hh : 0.0
+    else
+        ll = ta.lowest(low, TPLookback)[1]
+        best := (not na(ll) and ll > 0 and ll < entryPx) ? ll : 0.0
+    best
+f_resolveTP(dir, entryPx, d) =>
+    tpx = dir > 0 ? entryPx + d * RR_Ratio : entryPx - d * RR_Ratio
+    if TPMode == "Structural"
+        lvl = f_structTP(dir, entryPx)
+        if lvl > 0.0
+            dist = dir > 0 ? (lvl - entryPx) : (entryPx - lvl)
+            if dist >= syminfo.mintick * 10 and dist >= d * TPMinRR
+                tpx := lvl
+    tpx
+canLong  = canEnter and strategy.position_size == 0
+canShort = canEnter and strategy.position_size == 0
+// v3.5.0: the ONLY entry trigger is the Sci ICC continuation.
+longTrigger  = iccBuySig and mlPass
+shortTrigger = iccSellSig and mlPass
+// --- runner/exit state (persists across bars; reset when flat) ------------
+var float runEntry = na    // entry price of the live position
+var float runStop  = na    // live ratcheting stop price
+var float runPeak  = na    // best price since entry (peak for long / trough for short)
+var int   runDir   = 0     // +1 long / -1 short / 0 flat
+var float runRisk  = na    // v3.6.0: 1R = |avg entry - initial stop|, captured at entry
+var bool  runPartialDone = false
+var bool  runMLRunner = true  // v3.6.0: partial taken once per position
+var float rxCurR   = 0.0   // v3.6.0 dashboard: live open R
+var string rxHealth= "-"   // v3.6.0 dashboard: HEALTHY / CAUTION / REVERSAL
+// ---- v3.9.0 icc_ml_v2 per-trade recorder (frozen features + reached-R) ------
+var float  v2Entry = na
+var float  v2Risk  = na
+var int    v2Dir   = 0
+var float  v2MFER  = 0.0
+var float  v2MAER  = 0.0
+var bool   v2R1 = false
+var bool   v2R2 = false
+var bool   v2R3 = false
+var bool   v2R5 = false
+var bool   v2R10 = false
+var int    v2T2Rbar = na
+var int    v2EntryBar = na
+var float  v2fHTF = na
+var int    v2fExt = 0
+var int    v2fInt = 0
+var int    v2fSweepL = 0
+var int    v2fSweepS = 0
+var float  v2fDisp = na
+var int    v2fFVG = 0
+var int    v2fOB = 0
+var float  v2fATR = na
+var int    v2fSession = 0
+var int    v2fRegime = 0
+var float  v2fFVGdistATR = na
+var float  v2fOTE = na
+var float  v2fFVGsizeATR = na
+var float  v2fRiskDistATR = na
+var int    v2fHour = 0
+var int    v2fMinOfDay = 0
+var float  v2fTsin = na
+var float  v2fTcos = na
+var float  v2fP2 = na
+var float  v2fRiskMult = na
+var string v2Sym = ""
+var float  v2LastPos = 0.0
+// pip inputs -> price distances (mirror of the EA point inputs)
+runArm   = RunnerArmPips   * pip
+runLock  = RunnerLockPips  * pip
+runTrail = RunnerTrailPips * pip
+// reset the runner state whenever flat (state is per-open-position, like the EA)
+if strategy.position_size == 0
+    runDir   := 0
+    runEntry := na
+    runStop  := na
+    runPeak  := na
+    runRisk  := na
+    runPartialDone := false
+    runMLRunner := true
+if canLong and longTrigger
+    entryPx  = close
+    slAnchor = iccSigSL > 0 ? iccSigSL : wkLastLo
+    slDist   = math.max(entryPx - slAnchor, atrVal * ATR_Multiplier)
+    slDist  := math.max(slDist, slBuf)
+    slPrice  = entryPx - slDist
+    // v3.5.0/v3.6.0: open with NO fixed TP so the winner can run; the ratchet
+    // below (v3.5.0 pip-runner OR v3.6.0 R-engine) rides and protects it.
+    runMLRunner := mlRunnerOK
+    tpPrice  = ((LetWinnersRun or useRexit) and runMLRunner) ? na : f_resolveTP(1, entryPx, slDist)
+    mlQty = mlMode == "FILTER+SIZE" ? (strategy.equity * (mlBaseEquityPct * mlRiskMult) / 100.0) / close : na
+    strategy.entry("LONG", strategy.long, qty=mlQty, comment="ICC BUY")
+    strategy.exit("LONG-x", from_entry="LONG", stop=slPrice, limit=tpPrice, comment="exit")
+    // v3.9.0 icc_ml_v2: freeze signal-time features + 1R at entry (no leakage)
+    v2Entry := entryPx
+    v2Risk  := slDist
+    v2Dir   := 1
+    v2MFER  := 0.0
+    v2MAER  := 0.0
+    v2R1 := false
+    v2R2 := false
+    v2R3 := false
+    v2R5 := false
+    v2R10 := false
+    v2T2Rbar := na
+    v2EntryBar := bar_index
+    v2fHTF := htfScore
+    v2fExt := extTrend
+    v2fInt := intTrend
+    v2fSweepL := sweepConfLong
+    v2fSweepS := sweepConfShort
+    v2fDisp := lastDispScore
+    v2fFVG := activeFVG
+    v2fOB := activeOB
+    v2fATR := atrVal
+    v2fSession := sessionCode
+    v2fRegime := regimeCode
+    v2fFVGdistATR := mlFVGMidDistATR
+    v2fOTE := mlSigOTEDepth
+    v2fFVGsizeATR := mlFVGSizeATR
+    v2fRiskDistATR := mlRiskDistanceATR
+    v2fHour := mlHour
+    v2fMinOfDay := mlMinuteOfDay
+    v2fTsin := mlTimeSin
+    v2fTcos := mlTimeCos
+    v2fP2 := mlP2
+    v2fRiskMult := mlRiskMult
+    v2Sym := syminfo.tickerid
+    runEntry := entryPx
+    runStop  := slPrice
+    runPeak  := entryPx
+    runDir   := 1
+    runRisk  := slDist          // v3.6.0: 1R captured from the initial stop
+    runPartialDone := false
+if canShort and shortTrigger
+    entryPx  = close
+    slAnchor = iccSigSL > 0 ? iccSigSL : wkLastHi
+    slDist   = math.max(slAnchor - entryPx, atrVal * ATR_Multiplier)
+    slDist  := math.max(slDist, slBuf)
+    slPrice  = entryPx + slDist
+    runMLRunner := mlRunnerOK
+    tpPrice  = ((LetWinnersRun or useRexit) and runMLRunner) ? na : f_resolveTP(-1, entryPx, slDist)
+    mlQty = mlMode == "FILTER+SIZE" ? (strategy.equity * (mlBaseEquityPct * mlRiskMult) / 100.0) / close : na
+    strategy.entry("SHORT", strategy.short, qty=mlQty, comment="ICC SELL")
+    strategy.exit("SHORT-x", from_entry="SHORT", stop=slPrice, limit=tpPrice, comment="exit")
+    // v3.9.0 icc_ml_v2: freeze signal-time features + 1R at entry (no leakage)
+    v2Entry := entryPx
+    v2Risk  := slDist
+    v2Dir   := -1
+    v2MFER  := 0.0
+    v2MAER  := 0.0
+    v2R1 := false
+    v2R2 := false
+    v2R3 := false
+    v2R5 := false
+    v2R10 := false
+    v2T2Rbar := na
+    v2EntryBar := bar_index
+    v2fHTF := htfScore
+    v2fExt := extTrend
+    v2fInt := intTrend
+    v2fSweepL := sweepConfLong
+    v2fSweepS := sweepConfShort
+    v2fDisp := lastDispScore
+    v2fFVG := activeFVG
+    v2fOB := activeOB
+    v2fATR := atrVal
+    v2fSession := sessionCode
+    v2fRegime := regimeCode
+    v2fFVGdistATR := mlFVGMidDistATR
+    v2fOTE := mlSigOTEDepth
+    v2fFVGsizeATR := mlFVGSizeATR
+    v2fRiskDistATR := mlRiskDistanceATR
+    v2fHour := mlHour
+    v2fMinOfDay := mlMinuteOfDay
+    v2fTsin := mlTimeSin
+    v2fTcos := mlTimeCos
+    v2fP2 := mlP2
+    v2fRiskMult := mlRiskMult
+    v2Sym := syminfo.tickerid
+    runEntry := entryPx
+    runStop  := slPrice
+    runPeak  := entryPx
+    runDir   := -1
+    runRisk  := slDist          // v3.6.0: 1R captured from the initial stop
+    runPartialDone := false
+// ---- v3.5.0 LET WINNERS RUN: per-bar profit-lock ratchet -----------------
+// Once armed, the stop is pulled into profit and only ever ratchets TIGHTER
+// (re-issued via strategy.exit), so a profitable trade stays open until price
+// retraces into the locked floor or an opposite ICC continuation flips
+// structure (handled above by CloseOnOpposite).
+if LetWinnersRun and runMLRunner and not useRexit and strategy.position_size != 0 and runDir != 0
+    if runDir > 0
+        runPeak := math.max(runPeak, high)
+        pp      = close - runEntry
+        newStop = runStop                                   // longs: stop only ever RISES
+        if pp >= runArm
+            newStop := math.max(newStop, runEntry + runLock)            // lock BE+lock in profit
+            if runTrail > 0
+                newStop := math.max(newStop, runPeak - runTrail)        // trail behind peak
+            if RunnerUseStruct and not na(intProtLow)
+                newStop := math.max(newStop, intProtLow - slBuf)        // structure trail
+        newStop := math.min(newStop, close - syminfo.mintick)           // keep the stop below price
+        if newStop > runStop
+            runStop := newStop
+            strategy.exit("LONG-x", from_entry="LONG", stop=runStop, comment="run")
+    else
+        runPeak := math.min(runPeak, low)
+        pp      = runEntry - close
+        newStop = runStop                                   // shorts: stop only ever FALLS
+        if pp >= runArm
+            newStop := math.min(newStop, runEntry - runLock)
+            if runTrail > 0
+                newStop := math.min(newStop, runPeak + runTrail)
+            if RunnerUseStruct and not na(intProtHigh)
+                newStop := math.min(newStop, intProtHigh + slBuf)
+        newStop := math.max(newStop, close + syminfo.mintick)           // keep the stop above price
+        if newStop < runStop
+            runStop := newStop
+            strategy.exit("SHORT-x", from_entry="SHORT", stop=runStop, comment="run")
+// ---- v3.6.0 R-MULTIPLE EXIT ENGINE (mirror of EA RX_ManageOne) -----------
+// 1R = runRisk (captured at entry from the initial stop). Stages: protect ->
+// lock -> structure runner, with a progressive give-back floor + ATR floor,
+// most-protective-wins, monotonic. A trend-health governor holds/tightens/
+// exits. Runs ONLY when useRexit is ON; supersedes the v3.5.0 ratchet above.
+if useRexit and runMLRunner and strategy.position_size != 0 and runDir != 0 and not na(runRisk) and runRisk > 0
+    avg   = strategy.position_avg_price
+    isLong= runDir > 0
+    curR  = isLong ? (close - avg) / runRisk : (avg - close) / runRisk
+    // trend health: external flip = REVERSAL, internal-only flip = CAUTION
+    health = not useTrendHealth ? 0 : isLong ? (extTrend == -1 ? 2 : intTrend == -1 ? 1 : 0) : (extTrend == 1 ? 2 : intTrend == 1 ? 1 : 0)
+    rxCurR   := curR
+    rxHealth := health == 2 ? "REVERSAL" : health == 1 ? "CAUTION" : "HEALTHY"
+    // (A) confirmed external reversal -> exit the whole position
+    if useTrendHealth and health == 2
+        strategy.close(isLong ? "LONG" : "SHORT", comment="EXIT ext-reversal")
+    else
+        // (B) optional partial at activation (once)
+        if usePartial and not runPartialDone and curR >= activateAtR
+            strategy.close(isLong ? "LONG" : "SHORT", qty_percent=partialPct, comment="PARTIAL +" + str.tostring(activateAtR, "#.#") + "R")
+            runPartialDone := true
+        // (C) most-protective valid stop candidate (one-way)
+        // progressive locked-profit R ladder (sentinel -1e18 = nothing locked)
+        lockR = -1e18
+        if curR >= protectAtR
+            lockR := math.max(lockR, protectLockR)
+        if curR >= lockAtR
+            lockR := math.max(lockR, lockProfitR)
+        if curR >= activateAtR
+            lockR := math.max(lockR, curR - runnerGiveBackR)
+        cand = isLong ? -1e18 : 1e18
+        have = false
+        if lockR > -1e17
+            fp = isLong ? avg + math.max(lockR, 0.0) * runRisk : avg - math.max(lockR, 0.0) * runRisk
+            cand := isLong ? math.max(cand, fp) : math.min(cand, fp)
+            have := true
+        if curR >= activateAtR
+            useInt = runnerInternStruct or (health == 1)       // CAUTION forces internal tighten
+            useExt = runnerExternStruct
+            if isLong
+                if useExt and not na(extProtLow)
+                    cand := math.max(cand, extProtLow - slBuf)
+                    have := true
+                if useInt and not na(intProtLow)
+                    cand := math.max(cand, intProtLow - slBuf)
+                    have := true
+                if runnerATRFloor and atrVal > 0
+                    cand := math.max(cand, close - atrVal * runnerATRfloorMult)
+                    have := true
+            else
+                if useExt and not na(extProtHigh)
+                    cand := math.min(cand, extProtHigh + slBuf)
+                    have := true
+                if useInt and not na(intProtHigh)
+                    cand := math.min(cand, intProtHigh + slBuf)
+                    have := true
+                if runnerATRFloor and atrVal > 0
+                    cand := math.min(cand, close + atrVal * runnerATRfloorMult)
+                    have := true
+        // (D) broker-legal clamp + one-way ratchet
+        if have
+            newStop = cand
+            if isLong
+                newStop := math.min(newStop, close - syminfo.mintick)
+                if na(runStop) or newStop > runStop
+                    runStop := newStop
+                    strategy.exit("LONG-x", from_entry="LONG", stop=runStop, comment="Rrun")
+            else
+                newStop := math.max(newStop, close + syminfo.mintick)
+                if na(runStop) or newStop < runStop
+                    runStop := newStop
+                    strategy.exit("SHORT-x", from_entry="SHORT", stop=runStop, comment="Rrun")
+// ============================ ML v2 TRADE TRACKING =======================
+// v3.9.0: track MFE/MAE in R while the position is open, then emit a JSON
+// "trade" payload on close carrying reached_1r..reached_10r + exit_r. The
+// label target is derived only from post-entry excursion (leakage-free).
+if strategy.position_size != 0 and v2Dir != 0 and not na(v2Risk) and v2Risk > 0
+    favR = v2Dir > 0 ? (high - v2Entry) / v2Risk : (v2Entry - low) / v2Risk
+    advR = v2Dir > 0 ? (v2Entry - low) / v2Risk : (high - v2Entry) / v2Risk
+    v2MFER := math.max(v2MFER, favR)
+    v2MAER := math.max(v2MAER, advR)
+    if not v2R1 and v2MFER >= 1.0
+        v2R1 := true
+    if not v2R2 and v2MFER >= 2.0
+        v2R2 := true
+        v2T2Rbar := bar_index
+    if not v2R3 and v2MFER >= 3.0
+        v2R3 := true
+    if not v2R5 and v2MFER >= 5.0
+        v2R5 := true
+    if not v2R10 and v2MFER >= 10.0
+        v2R10 := true
+if mlEmitTradeJSON and v2LastPos != 0 and strategy.position_size == 0 and v2Dir != 0
+    idxC = strategy.closedtrades - 1
+    exitPrice  = idxC >= 0 ? strategy.closedtrades.exit_price(idxC)  : close
+    profC      = idxC >= 0 ? strategy.closedtrades.profit(idxC)      : 0.0
+    exitR      = v2Risk > 0 ? (v2Dir > 0 ? (exitPrice - v2Entry) : (v2Entry - exitPrice)) / v2Risk : na
+    barsTo2R   = na(v2T2Rbar) ? -1 : (v2T2Rbar - v2EntryBar)
+    tradePayload = '{"schema":"icc_ml_v2","payload_type":"trade","symbol":"' + syminfo.ticker + '","symbol_id":"' + v2Sym + '","dir":' + str.tostring(v2Dir) + ',"entry_price":' + str.tostring(v2Entry) + ',"initial_risk":' + str.tostring(v2Risk) + ',"mfe_r":' + str.tostring(v2MFER) + ',"mae_r":' + str.tostring(v2MAER) + ',"reached_1r":' + (v2R1?"1":"0") + ',"reached_2r":' + (v2R2?"1":"0") + ',"reached_3r":' + (v2R3?"1":"0") + ',"reached_5r":' + (v2R5?"1":"0") + ',"reached_10r":' + (v2R10?"1":"0") + ',"bars_to_2r":' + str.tostring(barsTo2R) + ',"exit_price":' + str.tostring(exitPrice) + ',"exit_r":' + str.tostring(exitR) + ',"exit_money":' + str.tostring(profC) + ',"htf_score":' + str.tostring(v2fHTF) + ',"ext_trend":' + str.tostring(v2fExt) + ',"int_trend":' + str.tostring(v2fInt) + ',"sweep_long":' + str.tostring(v2fSweepL) + ',"sweep_short":' + str.tostring(v2fSweepS) + ',"disp":' + str.tostring(v2fDisp) + ',"fvg_active":' + str.tostring(v2fFVG) + ',"ob_active":' + str.tostring(v2fOB) + ',"atr":' + str.tostring(v2fATR) + ',"session":' + str.tostring(v2fSession) + ',"regime":' + str.tostring(v2fRegime) + ',"fvg_mid_dist_atr":' + str.tostring(v2fFVGdistATR) + ',"ote_depth":' + str.tostring(v2fOTE) + ',"fvg_size_atr":' + str.tostring(v2fFVGsizeATR) + ',"risk_distance_atr":' + str.tostring(v2fRiskDistATR) + ',"hour":' + str.tostring(v2fHour) + ',"minute_of_day":' + str.tostring(v2fMinOfDay) + ',"time_sin":' + str.tostring(v2fTsin) + ',"time_cos":' + str.tostring(v2fTcos) + ',"surrogate_p2":' + str.tostring(v2fP2) + ',"risk_mult":' + str.tostring(v2fRiskMult) + '}'
+    alert(tradePayload, alert.freq_once_per_bar_close)
+    v2Dir := 0
+v2LastPos := strategy.position_size
+// ============================ EXIT LABELS ================================
+// Draw a tag when a position closes (SL/TP/opposite). Reason is not exposed
+// by Pine, so colour = win/loss and text carries net P&L (visual parity).
+var float lastPosSize = 0.0
+if ShowExitLabels and lastPosSize != 0 and strategy.position_size == 0
+    idx  = strategy.closedtrades - 1
+    prof = idx >= 0 ? strategy.closedtrades.profit(idx) : 0.0
+    wasLong = lastPosSize > 0
+    col  = prof >= 0 ? ExitWinColor : ExitLossColor
+    txt  = "x EXIT" + (ExitLblShowProfit ? "  " + str.tostring(prof, "#.##") : "")
+    label.new(bar_index, close, txt, style=wasLong ? label.style_label_down : label.style_label_up, color=col, textcolor=color.white, size=size.small)
+lastPosSize := strategy.position_size
+// Entry markers
+plotshape(iccBuySig,  title="ICC Buy",  style=shape.triangleup,   location=location.belowbar, color=color.lime, size=size.tiny)
+plotshape(iccSellSig, title="ICC Sell", style=shape.triangledown, location=location.abovebar, color=color.red,  size=size.tiny)
+// ============================ DASHBOARD ==================================
+f_arrow(b) => b == 1 ? "▲" : b == -1 ? "▼" : "–"
+var table dash = table.new(position.top_right, 2, 21, border_width=1)
+if ShowDashboard and barstate.islast
+    table.clear(dash, 0, 0, 1, 20)
+    // v3.6.1 dual floating-P/L: $ from strategy.openprofit (account outcome) and
+    // pips from the position's average entry vs current close (chart behaviour).
+    flMoney = strategy.openprofit
+    flPips  = strategy.position_size > 0 ? (close - strategy.position_avg_price) / pip : strategy.position_size < 0 ? (strategy.position_avg_price - close) / pip : 0.0
+    flSgn   = flMoney >= 0 ? "+" : ""
+    flCol   = strategy.position_size == 0 ? color.gray : flMoney >= 0 ? color.teal : color.red
+    table.cell(dash, 0, 0, "ICC TradesBySci v3.9.0", text_color=color.white, bgcolor=color.new(color.navy, 0), text_size=size.small)
+    table.cell(dash, 1, 0, "SMC", text_color=color.white, bgcolor=color.new(color.navy, 0), text_size=size.small)
+    table.cell(dash, 0, 1, "Cascade D1/H4/H1/M15", text_size=size.tiny)
+    table.cell(dash, 1, 1, f_arrow(biasD1)+" "+f_arrow(biasH4)+" "+f_arrow(biasH1)+" "+f_arrow(biasM15)+"  ["+(alignBull?"^L":alignBear?"vS":"x")+"]", text_size=size.tiny)
+    table.cell(dash, 0, 2, "HTF bias / score", text_size=size.tiny)
+    table.cell(dash, 1, 2, (htfBias==1?"▲ BULL":htfBias==-1?"▼ BEAR":"– flat")+"  "+str.tostring(htfScore, "#.##"), text_size=size.tiny)
+    table.cell(dash, 0, 3, "ICC phase (dir)", text_size=size.tiny)
+    table.cell(dash, 1, 3, (iccPhase==1?"IND":iccPhase==2?"COR":"---")+" ("+str.tostring(iccDir)+")  [only entry]", text_size=size.tiny)
+    table.cell(dash, 0, 4, "External / Internal trend", text_size=size.tiny)
+    table.cell(dash, 1, 4, f_arrow(extTrend)+" / "+(na(intProtHigh)?"–":"set"), text_size=size.tiny)
+    table.cell(dash, 0, 5, "Liquidity", text_size=size.tiny)
+    table.cell(dash, 1, 5, liqStatus, text_size=size.tiny)
+    table.cell(dash, 0, 6, "Displacement", text_size=size.tiny)
+    table.cell(dash, 1, 6, str.tostring(lastDispScore, "#")+"/100", text_size=size.tiny)
+    table.cell(dash, 0, 7, "Active FVG / OB", text_size=size.tiny)
+    table.cell(dash, 1, 7, str.tostring(array.size(fvgActive))+" / "+str.tostring(array.size(obActive)), text_size=size.tiny)
+    table.cell(dash, 0, 8, "TP mode", text_size=size.tiny)
+    table.cell(dash, 1, 8, (LetWinnersRun or useRexit) ? "RUNNER (no fixed TP)" : TPMode, text_size=size.tiny)
+    table.cell(dash, 0, 9, "FVG contain", text_size=size.tiny)
+    table.cell(dash, 1, 9, RelaxFVGContain ? "RELAX"+(UseFVGband?"+band":"") : "STRICT", text_size=size.tiny)
+    table.cell(dash, 0, 10, "Kill-zone", text_size=size.tiny)
+    table.cell(dash, 1, 10, useKZ ? ("ON → "+kzActive+(inKZ?"  [OPEN]":"  [SHUT]")) : "OFF (all hours)", text_color=useKZ and not inKZ ? color.red : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 11, "OTE window", text_size=size.tiny)
+    table.cell(dash, 1, 11, useOTE ? ("ON "+str.tostring(oteMin,"#.##")+"-"+str.tostring(oteMax,"#.##")) : ("OFF (Corr "+str.tostring(CorrRetraceMin,"#.##")+"-"+str.tostring(CorrRetraceMax,"#.##")+")"), text_size=size.tiny)
+    table.cell(dash, 0, 12, "Position", text_size=size.tiny)
+    table.cell(dash, 1, 12, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "flat", text_size=size.tiny)
+    table.cell(dash, 0, 13, "Closed trades", text_size=size.tiny)
+    table.cell(dash, 1, 13, str.tostring(strategy.closedtrades), text_size=size.tiny)
+    table.cell(dash, 0, 14, "Runner", text_size=size.tiny)
+    table.cell(dash, 1, 14, LetWinnersRun ? ("ON arm="+str.tostring(RunnerArmPips,"#.#")+" lock="+str.tostring(RunnerLockPips,"#.#")+" trail="+str.tostring(RunnerTrailPips,"#.#")+(RunnerUseStruct?"+struct":"")) : "OFF", text_color=LetWinnersRun ? color.teal : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 15, "Exit R-eng", text_size=size.tiny)
+    table.cell(dash, 1, 15, useRexit ? ("ON prot="+str.tostring(protectAtR,"#.#")+"R lock@"+str.tostring(lockAtR,"#.#")+"R/+"+str.tostring(lockProfitR,"#.#")+"R act="+str.tostring(activateAtR,"#.#")+"R give="+str.tostring(runnerGiveBackR,"#.#")+"R"+(runnerExternStruct?" +E":"")+(runnerInternStruct?" +I":"")) : "OFF (legacy runner)", text_color=useRexit ? color.teal : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 16, "pos R / health", text_size=size.tiny)
+    table.cell(dash, 1, 16, (useRexit and strategy.position_size != 0) ? (str.tostring(rxCurR,"#.00")+"R  "+rxHealth+(usePartial?("  part="+str.tostring(partialPct,"#")+"%"):"")) : "-", text_color=rxHealth=="REVERSAL" ? color.red : rxHealth=="CAUTION" ? color.orange : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 17, "Floating P/L", text_size=size.tiny)
+    table.cell(dash, 1, 17, strategy.position_size == 0 ? "flat" : flSgn+str.tostring(flMoney,"#.##")+"  ( "+flSgn+str.tostring(flPips,"#.#")+" pips )", text_color=flCol, text_size=size.tiny)
+
+    table.cell(dash, 0, 18, "ML quality", text_size=size.tiny)
+    table.cell(dash, 1, 18, mlStatus+" P2="+str.tostring(mlP2,"#.00")+" P3="+str.tostring(mlP3,"#.00"), text_color=mlPass?color.teal:color.red, text_size=size.tiny)
+    table.cell(dash, 0, 19, "ML sizing / runner", text_size=size.tiny)
+    table.cell(dash, 1, 19, "x"+str.tostring(mlRiskMult,"#.00")+" / "+(mlRunnerOK?"RUN":"FIXED"), text_size=size.tiny)
+    table.cell(dash, 0, 20, "Regime / forecast", text_size=size.tiny)
+    table.cell(dash, 1, 20, regimeTxt+" / "+(forecastAgree?"AGREE":"CONFLICT"), text_size=size.tiny)
+// ============================ ALERTS =====================================
+alertcondition(iccBuySig,  "ICC Buy",  "ICC BUY continuation {{ticker}}")
+alertcondition(iccSellSig, "ICC Sell", "ICC SELL continuation {{ticker}}")

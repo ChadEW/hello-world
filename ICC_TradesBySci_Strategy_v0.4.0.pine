@@ -1,0 +1,1147 @@
+//@version=6
+// =================================================================================================
+// ICC_TradesBySci_Strategy_v0.4.0.pine
+// TYPE: TRADING STRATEGY. This is not an indicator.
+// PURPOSE: Transcript-grounded ICC research approximation, not discretionary execution parity.
+// STATUS: Static audit only; this release has not been compiled or backtested here.
+// HTF: Native-context [1] offsets with lookahead_on. Confirmed chart-close execution only.
+// ENTRY: Arm on confirmed correction; nested reversal/pullback/second reaction identifies entry.
+//        Do not require a completed HTF continuation or a break of the nested impulse extreme.
+// LEVELS: HTF body levels by default; chart HL/LH wick supplies initial protective stop.
+// TARGETS: Soft objective by default; optional rejection partial and hard limit are [ENG].
+// FILTERS: Larger-TF veto, equal-memory veto, ATR/depth thresholds are optional [ENG].
+// ML: v4 feature contract; manual identity checks are not training provenance. No model supplied.
+// LIMITS: Confirmed-bar delay differs from intrabar examples. Pivots are proxies for visual swings.
+//         Session windows do not measure volume. Gaps, slippage and feed revisions remain risks.
+//         Positive-price linear point-value instruments only; no live execution guarantee.
+// =================================================================================================
+strategy(
+     title = "ICC TradesBySci Strategy v0.4.0",
+     shorttitle = "ICC TBS STR v0.4.0",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 100000,
+     currency = currency.USD,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.01,
+     slippage = 1,
+     calc_on_order_fills = false,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     margin_long = 100,
+     margin_short = 100,
+     max_bars_back = 5000,
+     max_labels_count = 500,
+     max_lines_count = 500,
+     max_boxes_count = 100)
+
+// =================================================================================================
+// VERSION CONTRACTS
+// =================================================================================================
+const string STRATEGY_VERSION = "ICC_STRATEGY_v0.4.0"
+const string METHOD_VERSION   = "ICC_METHOD_v1.3"
+const string FEATURE_VERSION  = "ICC_FEATURES_v4_16"
+const string ALERT_SCHEMA     = "icc_setup_v4"
+
+// =================================================================================================
+// ENUMS AND CONSTANTS
+// =================================================================================================
+const int DIR_NONE  = 0
+const int DIR_LONG  = 1
+const int DIR_SHORT = -1
+
+const int ST_NO_TRADE     = 0
+const int ST_INDICATION   = 1
+const int ST_CORRECTION   = 2
+const int ST_CONTINUATION = 3
+
+const int REASON_ACCEPTED      = 0
+const int R001_NO_STRUCTURE    = 1
+const int R003_CORR_INCOMPLETE = 3
+const int R004_NO_LTF_REVERSAL = 4
+const int R005_TF_MISALIGN     = 5
+const int R006_EQUAL_EXTREMES  = 6
+const int R007_OUT_SESSION     = 7
+const int R008_STOP_INVALID    = 8
+const int R009_TARGET_INVALID  = 9
+const int R010_R_TOO_LOW       = 10
+const int R011_ENTRY_CHASED    = 11
+const int R012_FEATURE_NA      = 12
+const int R013_FEATURE_RANGE   = 13
+const int R014_MODEL_VERSION   = 14
+const int R015_MODEL_THRESHOLD = 15
+const int R016_RISK_LOCK       = 16
+const int R017_REPAINT_MODE    = 17
+const int R018_BUSY = 18
+const int R019_EXPIRED = 19
+const int R020_MODEL_NOT_READY = 20
+const int R021_WRONG_SIDE = 21
+const int R022_TARGET_USED = 22
+const int R023_SUBMIT_UNOBSERVED = 23
+
+// =================================================================================================
+// INPUTS
+// =================================================================================================
+const string G_TF = "1 - Timeframes and research mode"
+CFG_markupTf    = input.timeframe("60", "Markup timeframe [ICC]", group = G_TF)
+CFG_biasTf      = input.timeframe("240", "Bias timeframe [ICC]", group = G_TF)
+CFG_confirmed = input.bool(true, "Enable confirmed research trading", group = G_TF, tooltip = "OFF disables new entries. HTF data remains confirmed in both settings.")
+CFG_useBias     = input.bool(false, "Optional larger-TF trend veto [ENG]", group = G_TF)
+CFG_strictMarkup = input.bool(false, "Require pre-existing markup trend [ENG, may exclude reversals]", group = G_TF)
+CFG_strictBias  = input.bool(true, "Bias must be established, not undefined [ENG]", group = G_TF)
+
+CFG_minMarkupMinutes = input.int(60, "Minimum markup minutes [PROFILE]", minval=30, maxval=60, group=G_TF)
+const string G_STRUCTURE = "2 - Structure and ICC cycle"
+CFG_useBodies       = input.bool(true, "Use candle bodies for structural breaks [ICC]", group = G_STRUCTURE)
+CFG_markupPivot     = input.int(3, "Markup swing strength [ENG]", minval = 1, maxval = 20, group = G_STRUCTURE)
+CFG_entryPivot      = input.int(2, "Entry-TF swing strength [ENG]", minval = 1, maxval = 20, group = G_STRUCTURE)
+CFG_equalTolerance  = input.float(0.03, "Equal-extreme tolerance (%) [ENG]", minval = 0.0, step = 0.01, group = G_STRUCTURE)
+CFG_equalMemory     = input.int(60, "Equal-extreme memory (markup bars) [ENG]", minval = 1, maxval = 500, group = G_STRUCTURE)
+CFG_trendMaxAge     = input.int(200, "Trend-leg maximum age (bars) [ENG]", minval = 10, maxval = 2000, group = G_STRUCTURE)
+CFG_correctionPct   = input.float(0.0, "Correction trigger (% of indication leg) [ENG]", minval = 0.0, maxval = 90.0, step = 1.0, group = G_STRUCTURE)
+CFG_invalidationPct = input.float(50.0, "Invalidation beyond break level (% of leg) [ENG]", minval = 10.0, maxval = 300.0, step = 5.0, group = G_STRUCTURE)
+CFG_minLegAtr       = input.float(0.0, "Minimum indication leg (ATR) [ENG]", minval = 0.0, maxval = 5.0, step = 0.05, group = G_STRUCTURE)
+CFG_legTimeout      = input.int(10, "No-leg timeout (markup bars) [ENG]", minval = 2, maxval = 200, group = G_STRUCTURE)
+CFG_maxCycleBars    = input.int(96, "Maximum ICC cycle (markup bars) [ENG]", minval = 12, maxval = 500, group = G_STRUCTURE)
+CFG_ltfRecentBars   = input.int(20, "LTF reversal remains valid (chart bars) [ENG]", minval = 1, maxval = 200, group = G_STRUCTURE)
+CFG_maxChaseAtr     = input.float(0.50, "Maximum entry drift from reference (ATR) [ENG]", minval = 0.05, maxval = 5.0, step = 0.05, group = G_STRUCTURE)
+
+CFG_readyTimeout = input.int(96, "Correction-ready timeout (chart bars) [ENG]", minval = 1, maxval = 200, group = G_STRUCTURE)
+
+CFG_blockEquals = input.bool(false, "Optional historical equal-extreme veto [ENG]", group = G_STRUCTURE)
+CFG_markupAgeHours = input.int(120, "Maximum markup origin age (elapsed hours) [ENG]", minval = 12, maxval = 720, group = G_STRUCTURE)
+CFG_runnerAfterTarget = input.bool(true, "Use fine-TF structural exit only after TP1 is reached [ENG]", group = G_STRUCTURE)
+
+CFG_nestedTimeout = input.int(96, "Maximum unfinished entry setup (chart bars) [ENG]", minval=4, maxval=500, group=G_STRUCTURE)
+CFG_useChase = input.bool(false, "Enable entry-distance filter [ENG]", group=G_STRUCTURE)
+CFG_usePctInvalidation = input.bool(false, "Use percentage invalidation instead of protected origin [ENG]", group=G_STRUCTURE)
+const string G_SESSION = "3 - Session eligibility, not measured volume"
+CFG_useSession = input.bool(true, "Require London or New York session [ICC]", group = G_SESSION)
+CFG_london     = input.session("0300-1130:23456", "London window [ENG]", group = G_SESSION)
+CFG_newYork    = input.session("0930-1600:23456", "New York window [ENG]", group = G_SESSION)
+CFG_sessionTz  = input.string("America/New_York", "Session timezone [ENG]", options = ["America/New_York", "Europe/London", "UTC"], group = G_SESSION)
+
+const string G_RISK = "4 - Risk and execution"
+RISK_percent          = input.float(0.25, "Risk per trade (% equity) [RISK]", minval = 0.01, maxval = 5.0, step = 0.05, group = G_RISK)
+RISK_minR             = input.float(0.0, "Minimum reward/risk to TP1 [ENG]", minval = 0.0, maxval = 10.0, step = 0.25, group = G_RISK)
+RISK_stopBufferPct    = input.float(0.05, "Stop buffer beyond correction swing (%) [ENG]", minval = 0.0, maxval = 2.0, step = 0.01, group = G_RISK)
+RISK_tp1Percent       = input.float(70.0, "Position closed at TP1 (%) [ENG]", minval = 1.0, maxval = 99.0, step = 1.0, group = G_RISK)
+RISK_runnerR          = input.float(4.0, "Runner fallback target (R) [ENG]", minval = 1.0, maxval = 20.0, step = 0.5, group = G_RISK)
+RISK_maxHoldHours = input.int(0, "Optional maximum holding hours; 0 disables [ENG]", minval=0, maxval=720, group=G_RISK)
+RISK_maxDailyLossPct  = input.float(1.0, "Daily equity loss lock (%) [RISK]", minval = 0.1, maxval = 20.0, step = 0.1, group = G_RISK)
+RISK_maxWeeklyLossPct = input.float(2.5, "Weekly equity loss lock (%) [RISK]", minval = 0.1, maxval = 50.0, step = 0.1, group = G_RISK)
+RISK_maxQty           = input.float(1000000.0, "Maximum calculated quantity [RISK]", minval = 0.0, group = G_RISK)
+RISK_qtyStep          = input.float(1.0, "Quantity step [RISK]", minval = 0.00000001, group = G_RISK)
+
+RISK_slippageTicks = input.int(1, "Sizing slippage ticks: match Properties [RISK]", minval = 0, maxval = 1000, group = G_RISK)
+RISK_feePct = input.float(0.01, "Sizing fee % per side: match Properties [RISK]", minval = 0.0, maxval = 5.0, group = G_RISK)
+RISK_capitalPct = input.float(95.0, "Maximum unlevered capital allocation (%) [RISK]", minval = 1.0, maxval = 100.0, group = G_RISK)
+RISK_hardTp1 = input.bool(false, "Hard TP1 partial limit [ENG]; OFF = soft target", group = G_RISK)
+RISK_softPartial = input.bool(true, "Soft TP1: take partial on rejection after objective touch [ENG]", group=G_RISK)
+RISK_runnerUseTarget = input.bool(false, "Use runner R target instead of structure-only [ENG]", group = G_RISK)
+
+const string G_ML = "5 - Fixed-coefficient ML ranking"
+ML_ready = input.bool(false, "Approved trained model loaded [ML]", group = G_ML)
+ML_enabled       = input.bool(false, "Enable fixed logistic-regression gate [ML]", group = G_ML)
+ML_modelVersion  = input.string("ICC_LR_v4_16_UNTRAINED", "Model version [ML]", group = G_ML)
+ML_featureVersion= input.string("ICC_FEATURES_v4_16", "Model feature contract [ML]", group = G_ML)
+ML_threshold     = input.float(0.60, "Minimum model probability [ML]", minval = 0.0, maxval = 1.0, step = 0.01, group = G_ML)
+ML_intercept     = input.float(0.0, "Intercept", step = 0.0001, group = G_ML)
+ML_w01 = input.float(0.0, "W01 HTF trend", step = 0.0001, group = G_ML)
+ML_w02 = input.float(0.0, "W02 Bias trend", step = 0.0001, group = G_ML)
+ML_w03 = input.float(0.0, "W03 Nested direction or LTF trend", step = 0.0001, group = G_ML)
+ML_w04 = input.float(0.0, "W04 TF alignment", step = 0.0001, group = G_ML)
+ML_w05 = input.float(0.0, "W05 Equal extreme", step = 0.0001, group = G_ML)
+ML_w06 = input.float(0.0, "W06 Direction", step = 0.0001, group = G_ML)
+ML_w07 = input.float(0.0, "W07 Leg ATR", step = 0.0001, group = G_ML)
+ML_w08 = input.float(0.0, "W08 Correction depth", step = 0.0001, group = G_ML)
+ML_w09 = input.float(0.0, "W09 Entry drift ATR", step = 0.0001, group = G_ML)
+ML_w10 = input.float(0.0, "W10 Stop ATR", step = 0.0001, group = G_ML)
+ML_w11 = input.float(0.0, "W11 Target ATR", step = 0.0001, group = G_ML)
+ML_w12 = input.float(0.0, "W12 Reward/risk", step = 0.0001, group = G_ML)
+ML_w13 = input.float(0.0, "W13 Nested setup duration", step = 0.0001, group = G_ML)
+ML_w14 = input.float(0.0, "W14 Nested event age", step = 0.0001, group = G_ML)
+ML_w15 = input.float(0.0, "W15 Session class", step = 0.0001, group = G_ML)
+ML_w16 = input.float(0.0, "W16 Setup age", step = 0.0001, group = G_ML)
+
+const string G_DISPLAY = "6 - Display and diagnostics"
+DBG_showLevels = input.bool(true, "Show HTF structural levels", group = G_DISPLAY)
+DBG_showStages = input.bool(true, "Show indication/correction/continuation markers", group = G_DISPLAY)
+DBG_showRisk   = input.bool(true, "Show active entry/stop/targets", group = G_DISPLAY)
+DBG_showTable  = input.bool(true, "Show architecture dashboard", group = G_DISPLAY)
+DBG_showReject = input.bool(false, "Plot rejected continuation candidates", group = G_DISPLAY)
+
+// =================================================================================================
+// HELPERS
+// =================================================================================================
+f_clip(float value, float low, float high) =>
+    math.max(low, math.min(high, value))
+
+f_scale(float value, float low, float high) =>
+    high <= low ? 0.0 : f_clip(2.0 * (value - low) / (high - low) - 1.0, -1.0, 1.0)
+
+f_sigmoid(float z) =>
+    float bounded = f_clip(z, -20.0, 20.0)
+    1.0 / (1.0 + math.exp(-bounded))
+
+f_round_step(float value, float step) =>
+    step <= 0.0 ? value : math.floor(value / step) * step
+f_qty_step() =>
+    float units = RISK_qtyStep / syminfo.mincontract
+    float nearest = math.round(units)
+    float effective = math.abs(units-nearest) <= 1e-9 * math.max(1.0,math.abs(units)) ? nearest : math.ceil(units)
+    math.max(1.0,effective) * syminfo.mincontract
+
+f_reason_text(int reason) =>
+    switch reason
+        REASON_ACCEPTED      => "TRADE_ACCEPTED"
+        R001_NO_STRUCTURE    => "R001_NO_HTF_STRUCTURE"
+        R003_CORR_INCOMPLETE => "R003_CORRECTION_INCOMPLETE"
+        R004_NO_LTF_REVERSAL => "R004_NO_LTF_REVERSAL"
+        R005_TF_MISALIGN     => "R005_TF_MISALIGNMENT"
+        R006_EQUAL_EXTREMES  => "R006_EQUAL_EXTREMES"
+        R007_OUT_SESSION     => "R007_OUT_OF_SESSION"
+        R008_STOP_INVALID    => "R008_STOP_INVALID"
+        R009_TARGET_INVALID  => "R009_TARGET_INVALID"
+        R010_R_TOO_LOW       => "R010_R_TOO_LOW"
+        R011_ENTRY_CHASED    => "R011_ENTRY_CHASED"
+        R012_FEATURE_NA      => "R012_FEATURE_NA"
+        R013_FEATURE_RANGE   => "R013_FEATURE_OUT_OF_RANGE"
+        R014_MODEL_VERSION   => "R014_MODEL_VERSION_MISMATCH"
+        R015_MODEL_THRESHOLD => "R015_MODEL_BELOW_THRESHOLD"
+        R016_RISK_LOCK       => "R016_RISK_LOCK"
+        R017_REPAINT_MODE    => "R017_REPAINT_MODE_FORBIDDEN"
+        R018_BUSY => "R018_POSITION_BUSY"
+        R019_EXPIRED => "R019_SETUP_EXPIRED"
+        R020_MODEL_NOT_READY => "R020_MODEL_NOT_READY"
+        R021_WRONG_SIDE => "R021_WRONG_REACTION_SIDE"
+        R022_TARGET_USED => "R022_TARGET_ALREADY_REACHED"
+        R023_SUBMIT_UNOBSERVED => "R023_NO_FILL_OBSERVED"
+        => "UNCLASSIFIED"
+
+// =================================================================================================
+// STRUCTURE ENGINE
+// Exactly one writer updates the active swing high and low inside each context.
+// =================================================================================================
+f_structure(simple int pivotLength, float equalTolPct, int equalMemory, int trendAge) =>
+    float structuralHighSource = CFG_useBodies ? math.max(open, close) : high
+    float structuralLowSource  = CFG_useBodies ? math.min(open, close) : low
+    float pivotHigh = ta.pivothigh(structuralHighSource, pivotLength, pivotLength)
+    float pivotLow  = ta.pivotlow(structuralLowSource, pivotLength, pivotLength)
+
+    var float swingHigh = na
+    var float swingLow  = na
+    var int highClass = 0
+    var int lowClass  = 0
+    var int highBar = 0
+    var int lowBar  = 0
+    var int highOrigin = na
+    var int lowOrigin = na
+    var int equalBar = -1000000
+
+    bool equalHigh = not na(pivotHigh) and not na(swingHigh) and math.abs(pivotHigh - swingHigh) <= math.abs(swingHigh) * equalTolPct / 100.0
+    bool equalLow  = not na(pivotLow) and not na(swingLow) and math.abs(pivotLow - swingLow) <= math.abs(swingLow) * equalTolPct / 100.0
+
+    if equalHigh or equalLow
+        equalBar := bar_index
+
+    if not na(pivotHigh) and not equalHigh
+        highClass := na(swingHigh) ? 0 : pivotHigh > swingHigh ? 1 : -1
+        highBar := bar_index
+        highOrigin := time[pivotLength]
+        swingHigh := pivotHigh
+
+    if not na(pivotLow) and not equalLow
+        lowClass := na(swingLow) ? 0 : pivotLow > swingLow ? 1 : -1
+        lowBar := bar_index
+        lowOrigin := time[pivotLength]
+        swingLow := pivotLow
+
+    bool legsFresh = bar_index - highBar <= trendAge and bar_index - lowBar <= trendAge
+    int trend = not legsFresh ? DIR_NONE : highClass == 1 and lowClass == 1 ? DIR_LONG : highClass == -1 and lowClass == -1 ? DIR_SHORT : DIR_NONE
+    bool equalRecent = bar_index - equalBar <= equalMemory
+
+    [swingHigh, swingLow, trend, equalRecent, pivotHigh, pivotLow, highOrigin, lowOrigin]
+
+// =================================================================================================
+// HTF ICC ENGINE
+// State 0: no-trade zone. State 1: indication. State 2: correction. State 3: continuation event.
+// Active swings freeze in states 1-3. Only successful continuation reconciles; aborts do not.
+// =================================================================================================
+f_icc_engine(simple int pivotLength, float equalTolPct, int equalMemory, int trendAge,
+             float correctionPct, float invalidationPct, float minLegAtr,
+             int legTimeout, int maxCycleBars) =>
+    float srcH = CFG_useBodies ? math.max(open, close) : high
+    float srcL = CFG_useBodies ? math.min(open, close) : low
+    float up = CFG_useBodies ? close : high
+    float dn = CFG_useBodies ? close : low
+    float atr = ta.atr(14)
+    float ph = ta.pivothigh(srcH, pivotLength, pivotLength)
+    float pl = ta.pivotlow(srcL, pivotLength, pivotLength)
+    var float sh = na
+    var float sl = na
+    var int hc = 0
+    var int lc = 0
+    var int hb = 0
+    var int lb = 0
+    var int eqb = -1000000
+    var int hOriginTime = na
+    var int lOriginTime = na
+    var int extremeTime = na
+    var int highWatermark = -1
+    var int lowWatermark = -1
+    var int state = ST_NO_TRADE
+    var int dir = 0
+    var int cid = 0
+    var float level = na
+    var float extreme = na
+    var float corr = na
+    var float ref = na
+    var int refBar = na
+    var bool reached = false
+    var int ib = na
+    var int cb = na
+    var int correctionTime = na
+    var float legFloor = na
+    var float protectedOrigin = na
+    var int corrExtremeTime = na
+    var int corrExtremeBar = na
+    var int extremeBar = na
+    int sig = 0
+    bool indEvent = false
+    bool corEvent = false
+    bool finish = false
+    float eEntry = na
+    float eStop = na
+    float eTarget = na
+    int eIC = na
+    int eCC = na
+    int eAge = na
+    int startState = state
+    bool eqH = not na(ph) and not na(sh) and math.abs(ph-sh) <= math.max(syminfo.mintick, math.abs(sh)*equalTolPct/100.0)
+    bool eqL = not na(pl) and not na(sl) and math.abs(pl-sl) <= math.max(syminfo.mintick, math.abs(sl)*equalTolPct/100.0)
+    if eqH or eqL
+        eqb := bar_index
+    bool eqRecent = bar_index-eqb <= equalMemory
+    // Only post-reconciliation pivot ORIGINS can replace reconciled levels.
+    if startState == ST_NO_TRADE
+        if not na(ph) and not eqH and bar_index-pivotLength > highWatermark
+            hc := na(sh) ? 0 : ph > sh ? 1 : -1
+            sh := ph
+            hb := bar_index
+            hOriginTime := time[pivotLength]
+        if not na(pl) and not eqL and bar_index-pivotLength > lowWatermark
+            lc := na(sl) ? 0 : pl > sl ? 1 : -1
+            sl := pl
+            lb := bar_index
+            lOriginTime := time[pivotLength]
+        bool rangeOk = not na(sh) and not na(sl) and sh > sl and not na(atr) and not na(hOriginTime) and not na(lOriginTime) and time-hOriginTime <= CFG_markupAgeHours*3600000 and time-lOriginTime <= CFG_markupAgeHours*3600000
+        bool bullBreak = rangeOk and up > sh and up[1] <= sh
+        bool bearBreak = rangeOk and dn < sl and dn[1] >= sl
+        // Reject a wick bar that breaks both boundaries: OHLC does not prove sequence.
+        if bullBreak != bearBreak
+            dir := bullBreak ? 1 : -1
+            level := bullBreak ? sh : sl
+            protectedOrigin := bullBreak ? sl : sh
+            extremeBar := bar_index
+            extreme := bullBreak ? srcH : srcL
+            extremeTime := time
+            corr := na
+            ref := na
+            refBar := na
+            reached := false
+            ib := bar_index
+            cb := na
+            correctionTime := na
+            legFloor := math.max(syminfo.mintick, atr*minLegAtr)
+            cid += 1
+            state := ST_INDICATION
+            indEvent := true
+    else if startState == ST_INDICATION
+        float oldExtreme = extreme
+        bool extends = dir == 1 ? srcH > oldExtreme : srcL < oldExtreme
+        extreme := dir == 1 ? math.max(extreme,srcH) : math.min(extreme,srcL)
+        if extends
+            extremeTime := time
+            extremeBar := bar_index
+        float leg = math.abs(extreme-level)
+        float pull = dir == 1 ? extreme-low : high-extreme
+        bool adverseClose = dir == 1 ? close < close[1] : close > close[1]
+        bool dead = dir == 1 ? close < (CFG_usePctInvalidation ? level-math.max(leg,legFloor)*invalidationPct/100.0 : protectedOrigin) : close > (CFG_usePctInvalidation ? level+math.max(leg,legFloor)*invalidationPct/100.0 : protectedOrigin)
+        if dead or bar_index-ib >= maxCycleBars or (bar_index-ib >= legTimeout and leg <= legFloor)
+            finish := true
+        else if not extends and adverseClose and leg > legFloor and pull >= leg*correctionPct/100.0
+            corr := dir == 1 ? low : high
+            corrExtremeTime := time
+            corrExtremeBar := bar_index
+            reached := dir == 1 ? low <= level : high >= level
+            cb := bar_index
+            correctionTime := time
+            state := ST_CORRECTION
+            corEvent := true
+    else if startState == ST_CORRECTION
+        // Freeze indication extreme/TP1. The continuation cannot move its own objective.
+        bool newCorrExtreme = dir == 1 ? low < corr : high > corr
+        corr := dir == 1 ? math.min(corr,low) : math.max(corr,high)
+        if newCorrExtreme
+            corrExtremeTime := time
+            corrExtremeBar := bar_index
+        bool reachedBefore = reached
+        reached := reached or (dir == 1 ? low <= level : high >= level)
+        float oldRef = ref
+        int oldRefBar = refBar
+        float trigger = reachedBefore ? level : oldRef
+        bool eligibleRef = reachedBefore or (not na(oldRefBar) and bar_index > oldRefBar)
+        bool push = eligibleRef and not na(trigger) and (dir == 1 ? up > trigger and up[1] <= trigger : dn < trigger and dn[1] >= trigger)
+        float leg = math.max(math.abs(extreme-level),legFloor)
+        bool dead = dir == 1 ? close < (CFG_usePctInvalidation ? level-leg*invalidationPct/100.0 : protectedOrigin) : close > (CFG_usePctInvalidation ? level+leg*invalidationPct/100.0 : protectedOrigin)
+        if dead or bar_index-ib >= maxCycleBars
+            finish := true
+        else if push
+            sig := dir
+            eEntry := trigger
+            eStop := corr
+            eTarget := extreme
+            eIC := cb-ib
+            eCC := bar_index-cb
+            eAge := bar_index-ib
+            state := ST_CONTINUATION
+        else
+            // A correction reference must ORIGINATE inside the correction, not merely confirm there.
+            if dir == 1 and not na(ph) and bar_index-pivotLength >= cb
+                ref := ph
+                refBar := bar_index
+            if dir == -1 and not na(pl) and bar_index-pivotLength >= cb
+                ref := pl
+                refBar := bar_index
+    else if startState == ST_CONTINUATION
+        finish := true
+    if finish and startState == ST_CONTINUATION
+        // Reconciliation is an engineering structure policy, not a claim of confirmed pivot status.
+        if dir == 1
+            hc := na(sh) ? 0 : extreme > sh ? 1 : extreme < sh ? -1 : 0
+            sh := extreme
+            hb := bar_index
+            highWatermark := dir == 1 ? extremeBar : corrExtremeBar
+            hOriginTime := extremeTime
+            if not na(corr)
+                lc := na(sl) ? 0 : corr > sl ? 1 : corr < sl ? -1 : 0
+                sl := corr
+                lb := bar_index
+                lowWatermark := dir == -1 ? extremeBar : corrExtremeBar
+                lOriginTime := corrExtremeTime
+        else if dir == -1
+            lc := na(sl) ? 0 : extreme < sl ? -1 : extreme > sl ? 1 : 0
+            sl := extreme
+            lb := bar_index
+            lowWatermark := dir == -1 ? extremeBar : corrExtremeBar
+            lOriginTime := extremeTime
+            if not na(corr)
+                hc := na(sh) ? 0 : corr < sh ? -1 : corr > sh ? 1 : 0
+                sh := corr
+                hb := bar_index
+                highWatermark := dir == 1 ? extremeBar : corrExtremeBar
+                hOriginTime := corrExtremeTime
+    if finish
+        state := ST_NO_TRADE
+        dir := 0
+        level := na
+        extreme := na
+        corr := na
+        ref := na
+        refBar := na
+        reached := false
+        ib := na
+        cb := na
+        correctionTime := na
+    bool fresh = bar_index-hb <= trendAge and bar_index-lb <= trendAge
+    int trend = not fresh ? 0 : hc == 1 and lc == 1 ? 1 : hc == -1 and lc == -1 ? -1 : 0
+    [sh,sl,trend,eqRecent,state,dir,level,extreme,corr,sig,cid,
+     eEntry,eStop,eTarget,eIC,eCC,eAge,indEvent,corEvent,correctionTime,time,atr,bar_index,extremeTime,protectedOrigin,corrExtremeTime]
+
+// Offset every tuple member in the REQUESTED context, not on the chart after merging.
+f_confirmed_icc() =>
+    [a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,t,u,v,w,x,y,z,aa] = f_icc_engine(CFG_markupPivot,
+         CFG_equalTolerance,CFG_equalMemory,CFG_trendMaxAge,CFG_correctionPct,
+         CFG_invalidationPct,CFG_minLegAtr,CFG_legTimeout,CFG_maxCycleBars)
+    [a[1],b[1],c[1],d[1],e[1],f[1],g[1],h[1],i[1],j[1],k[1],l[1],m[1],n[1],
+     o[1],p[1],q[1],r[1],t[1],u[1],v[1],w[1],x[1],y[1],z[1],aa[1]]
+
+f_confirmed_bias() =>
+    [a,b,c,d,e,f,g,h] = f_structure(CFG_markupPivot,CFG_equalTolerance,CFG_equalMemory,CFG_trendMaxAge)
+    [a[1],b[1],c[1],d[1],e[1],f[1],g[1],h[1]]
+
+// =================================================================================================
+// MULTI-TIMEFRAME DATA
+// =================================================================================================
+// Reject tick intervals before attempting time conversion.
+if barstate.isfirst and str.endswith(timeframe.period,"T")
+    runtime.error("Tick charts are unsupported; select a time-based chart.")
+int chartSeconds = timeframe.in_seconds()
+int markupSeconds = timeframe.in_seconds(CFG_markupTf)
+int biasSeconds = timeframe.in_seconds(CFG_biasTf)
+bool tfContractOk = not na(chartSeconds) and chartSeconds > 0 and chartSeconds < markupSeconds and (not CFG_useBias or markupSeconds <= biasSeconds)
+if barstate.isfirst
+    if not chart.is_standard
+        runtime.error("Use standard time-based OHLC charts; synthetic chart signals are unsupported.")
+    if na(syminfo.mintick) or na(syminfo.pointvalue) or na(syminfo.mincontract) or syminfo.mintick <= 0 or syminfo.pointvalue <= 0 or syminfo.mincontract <= 0
+        runtime.error("Invalid tick, point-value or minimum-contract metadata.")
+    if markupSeconds < CFG_minMarkupMinutes*60
+        runtime.error("Markup timeframe is below the selected profile minimum.")
+    if not tfContractOk
+        runtime.error("Require chart timeframe < markup; enabled bias must be >= markup.")
+
+[HTF_swingHigh,HTF_swingLow,HTF_trend,HTF_equalRecent,HTF_state,HTF_direction,
+ HTF_breakLevel,HTF_extreme,HTF_correctionExtreme,HTF_signal,HTF_cycleId,
+ HTF_entryReference,HTF_stopReference,HTF_targetReference,HTF_indToCorrBars,
+ HTF_corrToContBars,HTF_setupAge,HTF_indicationEvent,HTF_correctionEvent,
+ HTF_correctionTime,HTF_barTime,HTF_atr,HTF_nativeBar,HTF_extremeTime,HTF_protectedOrigin,HTF_corrExtremeTime] = request.security(syminfo.tickerid,CFG_markupTf,
+     f_confirmed_icc(),gaps=barmerge.gaps_off,lookahead=barmerge.lookahead_on)
+[BIAS_swingHigh,BIAS_swingLow,BIAS_trend,BIAS_equal,BIAS_pivotHigh,BIAS_pivotLow,BIAS_highOrigin,BIAS_lowOrigin] =
+     request.security(syminfo.tickerid,CFG_biasTf,f_confirmed_bias(),
+         gaps=barmerge.gaps_off,lookahead=barmerge.lookahead_on)
+[LTF_swingHigh,LTF_swingLow,LTF_trend,LTF_equalRecent,LTF_pivotHigh,LTF_pivotLow,LTF_highOrigin,LTF_lowOrigin] =
+     f_structure(CFG_entryPivot,CFG_equalTolerance,CFG_equalMemory,CFG_trendMaxAge)
+bool researchBarOk = CFG_confirmed and barstate.isconfirmed
+
+// Transcript baseline: confirmed HTF indication/correction context; chart-TF reversal identifies
+// completion. No prerequisite that a second HTF continuation candle has already completed.
+// Arm at the first CONFIRMED correction, not at the completed HTF continuation.
+var int armedCycle = -1
+var bool pending = false
+var int pendingDir = 0
+var int pendingCycle = -1
+var int pendingBar = na
+var float pendingRef = na
+var float pendingStop = na
+var float pendingTarget = na
+var float pendingLeg = na
+var float pendingHtfAtr = na
+var int pendingIC = na
+var int pendingCC = na
+var int pendingAge = na
+var int pendingNativeBar = na
+var int pendingCorrectionNative = na
+var bool pendingTargetUsed = false
+var float pendingProtectedOrigin = na
+var int pendingCorrectionTime = na
+var int lastAttemptEvent = na
+var int nestedCycle = -1
+var int nestedState = 0
+var bool sawCountertrend = false
+var float nestedLevel = na
+var float nestedExtreme = na
+var float nestedStop = na
+var float nestedOriginStop = na
+var int nestedIndBar = na
+var int nestedPullBar = na
+var int nestedEventBar = na
+var int nestedDir = 0
+var int nestedContextTime = na
+var int nestedContextDir = 0
+var float nestedStructuralStop = na
+var float nestedTrigger = na
+var int nestedStopConfirmBar = na
+var bool nestedReclaimSeen = false
+bool htfContextActive = HTF_state == ST_INDICATION or HTF_state == ST_CORRECTION or HTF_state == ST_CONTINUATION
+bool retainedContext = pending and HTF_cycleId == pendingCycle and not pendingTargetUsed and bar_index-pendingBar < CFG_readyTimeout and not na(pendingProtectedOrigin) and (pendingDir == 1 ? low > pendingProtectedOrigin : high < pendingProtectedOrigin)
+bool contextActive = htfContextActive or retainedContext
+bool contextChanged = HTF_cycleId != nestedCycle or (HTF_state == ST_INDICATION and not na(HTF_extremeTime) and HTF_extremeTime != nestedContextTime)
+if contextChanged or not contextActive
+    nestedCycle := HTF_cycleId
+    nestedState := 0
+    sawCountertrend := false
+    nestedLevel := na
+    nestedExtreme := na
+    nestedStop := na
+    nestedOriginStop := na
+    nestedIndBar := na
+    nestedPullBar := na
+    nestedEventBar := na
+    nestedDir := 0
+    nestedContextTime := htfContextActive ? HTF_extremeTime : retainedContext ? pendingCorrectionTime : na
+    nestedContextDir := htfContextActive ? HTF_direction : retainedContext ? pendingDir : 0
+if contextActive and nestedContextDir == 0
+    nestedContextTime := htfContextActive ? HTF_extremeTime : pendingCorrectionTime
+    nestedContextDir := htfContextActive ? HTF_direction : pendingDir
+int nestedStart = nestedState
+float lUp = CFG_useBodies ? close : high
+float lDn = CFG_useBodies ? close : low
+float lHighSource = CFG_useBodies ? math.max(open,close) : high
+float lLowSource = CFG_useBodies ? math.min(open,close) : low
+bool resetNested = false
+int correctionOrigin = not na(HTF_correctionTime) ? HTF_correctionTime : pendingCorrectionTime
+bool correctionContext = contextActive and not na(correctionOrigin) and (HTF_state == ST_CORRECTION or HTF_state == ST_CONTINUATION or retainedContext)
+if correctionContext and nestedContextDir != 0
+    if nestedStart == 0
+        float ref = nestedContextDir == 1 ? LTF_swingHigh[1] : LTF_swingLow[1]
+        float originStop = nestedContextDir == 1 ? LTF_swingLow[1] : LTF_swingHigh[1]
+        int refOrigin = nestedContextDir == 1 ? LTF_highOrigin[1] : LTF_lowOrigin[1]
+        int stopOrigin = nestedContextDir == 1 ? LTF_lowOrigin[1] : LTF_highOrigin[1]
+        // A correction high/low must precede its reversal-origin swing; both belong to this correction.
+        bool pairOk = not na(refOrigin) and not na(stopOrigin) and refOrigin >= correctionOrigin and stopOrigin > refOrigin and not na(originStop)
+        bool breakCounter = pairOk and not na(ref) and (nestedContextDir == 1 ? lUp > ref and lUp[1] <= ref : lDn < ref and lDn[1] >= ref)
+        if breakCounter
+            nestedDir := nestedContextDir
+            nestedLevel := ref
+            nestedExtreme := nestedDir == 1 ? lHighSource : lLowSource
+            nestedOriginStop := originStop
+            nestedStop := na
+            nestedStructuralStop := na
+            nestedTrigger := na
+            nestedStopConfirmBar := na
+            nestedReclaimSeen := false
+            nestedPullBar := na
+            nestedEventBar := na
+            nestedIndBar := bar_index
+            nestedState := 1
+    else if nestedStart == 1
+        bool extends = nestedDir == 1 ? lHighSource > nestedExtreme : lLowSource < nestedExtreme
+        nestedExtreme := nestedDir == 1 ? math.max(nestedExtreme,lHighSource) : math.min(nestedExtreme,lLowSource)
+        bool originBroken = nestedDir == 1 ? close <= nestedOriginStop : close >= nestedOriginStop
+        bool pull = nestedDir == 1 ? close < close[1] : close > close[1]
+        if originBroken
+            resetNested := true
+        else if not extends and pull
+            nestedPullBar := bar_index
+            nestedState := 2
+    else if nestedStart == 2
+        bool originBroken = nestedDir == 1 ? close <= nestedOriginStop : close >= nestedOriginStop
+        float pivot = nestedDir == 1 ? LTF_pivotLow : LTF_pivotHigh
+        bool correctiveSwing = not na(pivot) and bar_index-CFG_entryPivot >= nestedPullBar and (nestedDir == 1 ? pivot > nestedOriginStop : pivot < nestedOriginStop)
+        if correctiveSwing
+            nestedStructuralStop := pivot
+            nestedStop := nestedDir == 1 ? low[CFG_entryPivot] : high[CFG_entryPivot]
+            nestedStopConfirmBar := bar_index
+            nestedTrigger := na
+            nestedReclaimSeen := false
+        // Shallow correction: use a fresh corrective swing boundary, never the first impulse extreme.
+        float triggerPivot = nestedDir == 1 ? LTF_pivotHigh : LTF_pivotLow
+        if not na(nestedStop) and not na(triggerPivot) and bar_index-CFG_entryPivot >= nestedPullBar
+            nestedTrigger := triggerPivot
+        if not na(nestedStop) and (nestedDir == 1 ? close <= nestedLevel : close >= nestedLevel)
+            nestedReclaimSeen := true
+        bool reclaim = nestedReclaimSeen and (nestedDir == 1 ? close > nestedLevel and close[1] <= nestedLevel : close < nestedLevel and close[1] >= nestedLevel)
+        bool shallowBreak = not na(nestedTrigger[1]) and (nestedDir == 1 ? close > nestedTrigger[1] and close[1] <= nestedTrigger[1] : close < nestedTrigger[1] and close[1] >= nestedTrigger[1])
+        bool stopBroken = not na(nestedStop) and (nestedDir == 1 ? low <= nestedStop : high >= nestedStop)
+        bool secondPush = not na(nestedStopConfirmBar) and bar_index > nestedStopConfirmBar and (reclaim or shallowBreak)
+        if originBroken or stopBroken
+            resetNested := true
+        else if secondPush
+            nestedEventBar := bar_index
+            nestedState := 3
+bool unfinishedExpired = (nestedState == 1 or nestedState == 2) and not na(nestedIndBar) and bar_index-nestedIndBar >= CFG_nestedTimeout
+bool eventExpired = nestedState == 3 and not na(nestedEventBar) and bar_index-nestedEventBar > CFG_ltfRecentBars
+bool eventBroken = nestedState == 3 and (nestedDir == 1 ? low <= nestedStop : high >= nestedStop)
+if resetNested or unfinishedExpired or eventExpired or eventBroken or contextChanged or not contextActive
+    nestedState := 0
+    nestedDir := 0
+    nestedLevel := na
+    nestedExtreme := na
+    nestedStop := na
+    nestedStructuralStop := na
+    nestedOriginStop := na
+    nestedTrigger := na
+    nestedStopConfirmBar := na
+    nestedReclaimSeen := false
+    nestedIndBar := na
+    nestedPullBar := na
+    nestedEventBar := na
+    sawCountertrend := false
+bool nestedFresh = nestedState == 3 and not na(nestedEventBar) and bar_index-nestedEventBar <= CFG_ltfRecentBars
+bool LTF_bullRecent = nestedFresh and nestedDir == 1 and close > nestedLevel
+bool LTF_bearRecent = nestedFresh and nestedDir == -1 and close < nestedLevel
+
+bool newCorrection = HTF_state == ST_CORRECTION and HTF_cycleId != armedCycle
+if newCorrection
+    armedCycle := HTF_cycleId
+    pending := true
+    pendingDir := HTF_direction
+    pendingCycle := HTF_cycleId
+    pendingBar := bar_index
+    pendingRef := HTF_breakLevel
+    pendingStop := HTF_correctionExtreme
+    pendingProtectedOrigin := HTF_protectedOrigin
+    pendingCorrectionTime := HTF_correctionTime
+    lastAttemptEvent := na
+    pendingTarget := HTF_extreme
+    pendingLeg := math.abs(HTF_extreme-HTF_breakLevel)
+    pendingHtfAtr := HTF_atr
+    pendingIC := na
+    pendingCC := 0
+    pendingAge := 0
+    pendingNativeBar := HTF_nativeBar
+    pendingCorrectionNative := HTF_nativeBar
+    pendingTargetUsed := false
+if pending and HTF_cycleId == pendingCycle and contextActive
+    if not na(HTF_correctionExtreme)
+        pendingStop := HTF_correctionExtreme
+    // Durations are elapsed native bars since correction availability, not fictitious +1 bars.
+    pendingCC := math.max(0,HTF_nativeBar-pendingCorrectionNative)
+    pendingAge := pendingCC
+bool targetTouchedNow = pending and (pendingDir == 1 ? high >= pendingTarget : low <= pendingTarget)
+// Current close-market entry cannot capture a target already visited during this bar.
+pendingTargetUsed := pendingTargetUsed or targetTouchedNow
+bool pendingExpired = pending and (bar_index-pendingBar >= CFG_readyTimeout or HTF_cycleId != pendingCycle or not contextActive)
+bool pendingStopBroken = pending and (na(pendingProtectedOrigin) or (pendingDir == 1 ? low <= pendingProtectedOrigin : high >= pendingProtectedOrigin))
+bool nestedReady = pendingDir == 1 ? LTF_bullRecent : LTF_bearRecent
+bool reactionSideOk = pendingDir == 1 ? close > pendingRef : close < pendingRef
+bool freshAttempt = nestedReady and not na(nestedEventBar) and (na(lastAttemptEvent) or nestedEventBar != lastAttemptEvent)
+bool decisionDue = pending and (freshAttempt or pendingExpired or pendingStopBroken or pendingTargetUsed)
+bool rawLongEvent = decisionDue and pendingDir == 1
+bool rawShortEvent = decisionDue and pendingDir == -1
+int decisionAge = pendingAge
+int decisionCC = pendingCC
+
+// =================================================================================================
+// SESSION, ALIGNMENT, AND CAPITAL LOCKS
+// =================================================================================================
+int londonBarClose = time_close(timeframe.period, CFG_london, CFG_sessionTz)
+int nyBarClose = time_close(timeframe.period, CFG_newYork, CFG_sessionTz)
+bool inLondon = not na(londonBarClose) and time_close <= londonBarClose and not na(time(timeframe.period,CFG_london,CFG_sessionTz,bars_back=-1))
+bool inNewYork = not na(nyBarClose) and time_close <= nyBarClose and not na(time(timeframe.period,CFG_newYork,CFG_sessionTz,bars_back=-1))
+bool sessionOk = not CFG_useSession or inLondon or inNewYork
+int sessionClass = inLondon and inNewYork ? 3 : inNewYork ? 2 : inLondon ? 1 : 0
+
+bool biasLongOk  = not CFG_useBias or (CFG_strictBias ? BIAS_trend == DIR_LONG : BIAS_trend >= DIR_NONE)
+bool biasShortOk = not CFG_useBias or (CFG_strictBias ? BIAS_trend == DIR_SHORT : BIAS_trend <= DIR_NONE)
+bool alignmentLong  = (not CFG_strictMarkup or HTF_trend == DIR_LONG) and biasLongOk and LTF_bullRecent
+bool alignmentShort = (not CFG_strictMarkup or HTF_trend == DIR_SHORT) and biasShortOk and LTF_bearRecent
+
+// Calendar risk periods use the configured timezone. Anchors use previous close equity so a
+// first-bar overnight loss is not silently absorbed into the new period baseline.
+int dayKey = year(time_close,CFG_sessionTz)*10000+month(time_close,CFG_sessionTz)*100+dayofmonth(time_close,CFG_sessionTz)
+int calendarNoon = timestamp("UTC",year(time_close,CFG_sessionTz),month(time_close,CFG_sessionTz),dayofmonth(time_close,CFG_sessionTz),12,0)
+int mondayOffset = (dayofweek(time_close,CFG_sessionTz)+5)%7
+int weekKey = calendarNoon-mondayOffset*86400000
+bool newDay = na(dayKey[1]) or dayKey != dayKey[1]
+bool newWeek = na(weekKey[1]) or weekKey != weekKey[1]
+var float equityDayStart = na
+var float equityWeekStart = na
+var bool dailyLocked = false
+var bool weeklyLocked = false
+if newDay
+    equityDayStart := nz(strategy.equity[1],strategy.equity)
+    dailyLocked := false
+if newWeek
+    equityWeekStart := nz(strategy.equity[1],strategy.equity)
+    weeklyLocked := false
+float dailyReturnPct = equityDayStart > 0 ? 100.0*(strategy.equity-equityDayStart)/equityDayStart : -100.0
+float weeklyReturnPct = equityWeekStart > 0 ? 100.0*(strategy.equity-equityWeekStart)/equityWeekStart : -100.0
+dailyLocked := dailyLocked or dailyReturnPct <= -RISK_maxDailyLossPct
+weeklyLocked := weeklyLocked or weeklyReturnPct <= -RISK_maxWeeklyLossPct
+bool riskLock = dailyLocked or weeklyLocked or strategy.equity <= 0
+
+// =================================================================================================
+// ENTRY GEOMETRY AND FEATURE VECTOR
+// =================================================================================================
+float signalEntry = pendingDir != 0 ? close + pendingDir*RISK_slippageTicks*syminfo.mintick : na
+float signalStructuralStop = nestedReady ? nestedStructuralStop : na
+float signalCorrection = nestedReady and not na(nestedStop) ? nestedStop : pendingStop
+float signalReference = nestedReady and not na(nestedLevel) ? nestedLevel : pendingRef
+float signalTarget = pendingTarget
+float signalAtr = ta.atr(14)
+
+int signalDirection = rawLongEvent ? DIR_LONG : rawShortEvent ? DIR_SHORT : DIR_NONE
+bool continuationCandidate = signalDirection != DIR_NONE
+
+float stopPrice = na
+float tp1Price = na
+float runnerTarget = na
+float riskDistance = na
+float rewardDistance = na
+float rewardRisk = na
+float entryDriftAtr = na
+float quantity = na
+
+if continuationCandidate and not na(signalEntry) and not na(signalCorrection) and not na(signalTarget)
+    stopPrice := signalDirection == DIR_LONG ? math.floor((signalCorrection-math.max(syminfo.mintick,math.abs(signalCorrection)*RISK_stopBufferPct/100.0))/syminfo.mintick)*syminfo.mintick : math.ceil((signalCorrection+math.max(syminfo.mintick,math.abs(signalCorrection)*RISK_stopBufferPct/100.0))/syminfo.mintick)*syminfo.mintick
+    tp1Price := math.round_to_mintick(signalTarget)
+    riskDistance := signalDirection == DIR_LONG ? signalEntry - stopPrice : stopPrice - signalEntry
+    rewardDistance := signalDirection == DIR_LONG ? tp1Price - signalEntry : signalEntry - tp1Price
+    rewardRisk := riskDistance > 0 ? rewardDistance / riskDistance : na
+    runnerTarget := signalDirection == DIR_LONG ? signalEntry + riskDistance * RISK_runnerR : signalEntry - riskDistance * RISK_runnerR
+    entryDriftAtr := not na(signalAtr) and signalAtr > 0 ? math.abs(signalEntry - signalReference) / signalAtr : na
+    float riskCash = strategy.equity * RISK_percent / 100.0
+    float unitRisk = strategy.convert_to_account((riskDistance+RISK_slippageTicks*syminfo.mintick)*syminfo.pointvalue + (math.abs(signalEntry)+math.abs(stopPrice))*syminfo.pointvalue*RISK_feePct/100.0)
+    float unitNotional = strategy.convert_to_account(math.abs(signalEntry)*syminfo.pointvalue)
+    float capitalQty = unitNotional > 0 ? strategy.equity*RISK_capitalPct/100.0/(unitNotional*(1.0+RISK_feePct/100.0)) : na
+    float step = f_qty_step()
+    quantity := unitRisk > 0 and not na(capitalQty) ? f_round_step(math.min(math.min(riskCash/unitRisk,RISK_maxQty),capitalQty),step) : na
+
+float indicationLeg = pendingLeg
+float correctionDistance = not na(signalTarget) and not na(pendingStop) ? math.abs(signalTarget - pendingStop) : na
+float correctionDepth = not na(indicationLeg) and indicationLeg > 0 ? correctionDistance / indicationLeg : na
+float stopAtr = not na(signalAtr) and signalAtr > 0 and not na(riskDistance) ? riskDistance / signalAtr : na
+float targetAtr = not na(signalAtr) and signalAtr > 0 and not na(rewardDistance) ? rewardDistance / signalAtr : na
+float legAtr = not na(pendingHtfAtr) and pendingHtfAtr > 0 and not na(indicationLeg) ? indicationLeg / pendingHtfAtr : na
+float alignmentScore = signalDirection != 0 ? ((HTF_trend == signalDirection ? 1.0 : 0.0)+(BIAS_trend == signalDirection ? 1.0 : 0.0)+(LTF_trend == signalDirection ? 1.0 : 0.0))/3.0 : na
+
+// ICC_FEATURES_v4_16: changed trend/alignment/duration semantics; retraining required.
+// Values normalized to bounded values where appropriate.
+float FEAT_01 = float(HTF_trend)
+float FEAT_02 = float(BIAS_trend)
+float FEAT_03 = float(LTF_trend)
+float FEAT_04 = not na(alignmentScore) ? f_scale(alignmentScore, 0.0, 1.0) : na
+float FEAT_05 = HTF_equalRecent ? 1.0 : 0.0
+float FEAT_06 = float(signalDirection)
+float FEAT_07 = not na(legAtr) ? f_scale(f_clip(legAtr, 0.0, 5.0), 0.0, 5.0) : na
+float FEAT_08 = not na(correctionDepth) ? f_scale(f_clip(correctionDepth, 0.0, 1.5), 0.0, 1.5) : na
+float FEAT_09 = not na(entryDriftAtr) ? f_scale(f_clip(entryDriftAtr, 0.0, 2.0), 0.0, 2.0) : na
+float FEAT_10 = not na(stopAtr) ? f_scale(f_clip(stopAtr, 0.0, 5.0), 0.0, 5.0) : na
+float FEAT_11 = not na(targetAtr) ? f_scale(f_clip(targetAtr, 0.0, 8.0), 0.0, 8.0) : na
+float FEAT_12 = not na(rewardRisk) ? f_scale(f_clip(rewardRisk, 0.0, 8.0), 0.0, 8.0) : na
+float FEAT_13 = not na(nestedIndBar) ? f_clip(float(bar_index-nestedIndBar)/CFG_nestedTimeout,0.0,1.0) : na
+float FEAT_14 = not na(nestedEventBar) ? f_clip(float(bar_index-nestedEventBar)/CFG_ltfRecentBars,0.0,1.0) : na
+float FEAT_15 = f_scale(float(sessionClass), 0.0, 3.0)
+float FEAT_16 = not na(decisionAge) ? f_clip(float(decisionAge) / CFG_maxCycleBars, 0.0, 1.0) : na
+
+bool featureVectorValid = not na(FEAT_01) and not na(FEAT_02) and not na(FEAT_03) and not na(FEAT_04) and
+     not na(FEAT_05) and not na(FEAT_06) and not na(FEAT_07) and not na(FEAT_08) and
+     not na(FEAT_09) and not na(FEAT_10) and not na(FEAT_11) and not na(FEAT_12) and
+     not na(FEAT_13) and not na(FEAT_14) and not na(FEAT_15) and not na(FEAT_16)
+
+bool modelVersionOk = ML_featureVersion == FEATURE_VERSION and str.startswith(str.trim(ML_modelVersion),"ICC_LR_v4_16_")
+bool coefficientSignal = ML_w01 != 0 or ML_w02 != 0 or ML_w03 != 0 or ML_w04 != 0 or ML_w05 != 0 or ML_w06 != 0 or ML_w07 != 0 or ML_w08 != 0 or ML_w09 != 0 or ML_w10 != 0 or ML_w11 != 0 or ML_w12 != 0 or ML_w13 != 0 or ML_w14 != 0 or ML_w15 != 0 or ML_w16 != 0
+bool modelReady = ML_ready and coefficientSignal and str.length(str.trim(ML_modelVersion)) > 0 and not str.contains(str.upper(ML_modelVersion),"UNTRAINED")
+bool featureRangeOk = not na(legAtr) and legAtr >= 0 and legAtr <= 5 and not na(correctionDepth) and correctionDepth >= 0 and correctionDepth <= 1.5 and not na(entryDriftAtr) and entryDriftAtr >= 0 and entryDriftAtr <= 2 and not na(stopAtr) and stopAtr > 0 and stopAtr <= 5 and not na(targetAtr) and targetAtr > 0 and targetAtr <= 8 and not na(rewardRisk) and rewardRisk > 0 and rewardRisk <= 8 and not na(nestedIndBar) and bar_index-nestedIndBar >= 0 and bar_index-nestedIndBar <= CFG_nestedTimeout and not na(nestedEventBar) and bar_index-nestedEventBar <= CFG_ltfRecentBars and not na(decisionAge) and decisionAge <= CFG_maxCycleBars
+float modelLinear = featureVectorValid ? ML_intercept +
+     ML_w01 * FEAT_01 + ML_w02 * FEAT_02 + ML_w03 * FEAT_03 + ML_w04 * FEAT_04 +
+     ML_w05 * FEAT_05 + ML_w06 * FEAT_06 + ML_w07 * FEAT_07 + ML_w08 * FEAT_08 +
+     ML_w09 * FEAT_09 + ML_w10 * FEAT_10 + ML_w11 * FEAT_11 + ML_w12 * FEAT_12 +
+     ML_w13 * FEAT_13 + ML_w14 * FEAT_14 + ML_w15 * FEAT_15 + ML_w16 * FEAT_16 : na
+float modelProbability = featureVectorValid ? f_sigmoid(modelLinear) : na
+bool probabilityUsable = ML_enabled and modelReady and modelVersionOk and featureVectorValid and featureRangeOk and not na(modelProbability)
+bool modelOk = not ML_enabled or (probabilityUsable and modelProbability >= ML_threshold)
+
+// =================================================================================================
+// FAIL-CLOSED DECISION PIPELINE
+// =================================================================================================
+var int lastDecision = REASON_ACCEPTED
+var int lastDecisionTime = na
+var int lastSubmittedCycle = -1
+var int lastSubmitBar = -1
+int rejectReason = REASON_ACCEPTED
+if continuationCandidate
+    if not CFG_confirmed
+        rejectReason := R017_REPAINT_MODE
+    else if not tfContractOk
+        rejectReason := R005_TF_MISALIGN
+    else if pendingExpired
+        rejectReason := R019_EXPIRED
+    else if pendingStopBroken
+        rejectReason := R008_STOP_INVALID
+    else if strategy.position_size != 0 or lastSubmittedCycle == pendingCycle or lastSubmitBar == bar_index or strategy.position_size[1] != 0 or strategy.closedtrades > nz(strategy.closedtrades[1])
+        rejectReason := R018_BUSY
+    else if CFG_blockEquals and (HTF_equalRecent or LTF_equalRecent)
+        rejectReason := R006_EQUAL_EXTREMES
+    else if nestedReady and ((signalDirection == DIR_LONG and not alignmentLong) or (signalDirection == DIR_SHORT and not alignmentShort))
+        rejectReason := R005_TF_MISALIGN
+    else if pendingTargetUsed
+        rejectReason := R022_TARGET_USED
+    else if not reactionSideOk
+        rejectReason := R021_WRONG_SIDE
+    else if not nestedReady
+        rejectReason := R004_NO_LTF_REVERSAL
+    else if not sessionOk
+        rejectReason := R007_OUT_SESSION
+    else if na(signalEntry) or signalEntry <= 0 or na(stopPrice) or stopPrice <= 0 or na(riskDistance) or riskDistance <= 0 or na(quantity) or quantity <= 0
+        rejectReason := R008_STOP_INVALID
+    else if na(tp1Price) or tp1Price <= 0 or na(rewardDistance) or rewardDistance <= 0
+        rejectReason := R009_TARGET_INVALID
+    else if na(rewardRisk) or rewardRisk < RISK_minR
+        rejectReason := R010_R_TOO_LOW
+    else if CFG_useChase and (na(entryDriftAtr) or entryDriftAtr > CFG_maxChaseAtr)
+        rejectReason := R011_ENTRY_CHASED
+    else if riskLock
+        rejectReason := R016_RISK_LOCK
+    else if ML_enabled and not modelReady
+        rejectReason := R020_MODEL_NOT_READY
+    else if ML_enabled and not modelVersionOk
+        rejectReason := R014_MODEL_VERSION
+    else if ML_enabled and not featureVectorValid
+        rejectReason := R012_FEATURE_NA
+    else if ML_enabled and not featureRangeOk
+        rejectReason := R013_FEATURE_RANGE
+    else if ML_enabled and not modelOk
+        rejectReason := R015_MODEL_THRESHOLD
+
+if continuationCandidate and barstate.isconfirmed
+    lastDecision := rejectReason
+    lastDecisionTime := time_close
+    lastAttemptEvent := nestedEventBar
+    bool terminalDecision = rejectReason == REASON_ACCEPTED or pendingExpired or pendingStopBroken or pendingTargetUsed
+    pending := not terminalDecision
+    if not terminalDecision
+        nestedState := 0
+        nestedStop := na
+        nestedStructuralStop := na
+        nestedOriginStop := na
+        nestedLevel := na
+        nestedExtreme := na
+        nestedTrigger := na
+        nestedStopConfirmBar := na
+        nestedReclaimSeen := false
+        nestedIndBar := na
+        nestedPullBar := na
+        nestedEventBar := na
+        nestedDir := 0
+bool approvedLong = researchBarOk and rawLongEvent and rejectReason == REASON_ACCEPTED and strategy.position_size == 0
+bool approvedShort = researchBarOk and rawShortEvent and rejectReason == REASON_ACCEPTED and strategy.position_size == 0
+
+// =================================================================================================
+// EXECUTION ENGINE
+// One entry; fixed absolute TP1/runner quantities, completion flags, and structural runner.
+// =================================================================================================
+var float ACTIVE_entry = na
+var float ACTIVE_stop = na
+var float ACTIVE_tp1 = na
+var float ACTIVE_runnerTarget = na
+var int ACTIVE_direction = 0
+var int ACTIVE_entryBar = na
+var float ACTIVE_protectedSwing = na
+var float ACTIVE_qtyTp1 = na
+var float ACTIVE_qtyRunner = na
+var float ACTIVE_closedTp1 = 0.0
+var float ACTIVE_closedRunner = 0.0
+var bool ACTIVE_tp1Done = false
+var bool ACTIVE_runnerDone = false
+var bool ACTIVE_targetReached = false
+var int ACTIVE_submitBar = na
+var int ACTIVE_entryTime = na
+var float ACTIVE_riskBudget = na
+var bool ACTIVE_fillFault = false
+var bool ACTIVE_softSubmitted = false
+var int seenClosedTrades = 0
+bool closedThisBar = strategy.closedtrades > seenClosedTrades
+if closedThisBar
+    int firstNew = math.max(seenClosedTrades,strategy.closedtrades.first_index)
+    if firstNew <= strategy.closedtrades-1
+        for t = firstNew to strategy.closedtrades-1
+            string xid = strategy.closedtrades.exit_id(t)
+            float filledQty = math.abs(strategy.closedtrades.size(t))
+            if xid == "ICC-TP1-X" or strategy.closedtrades.exit_comment(t) == "Soft TP1 rejection"
+                ACTIVE_closedTp1 += filledQty
+            if xid == "ICC-RUN-X"
+                ACTIVE_closedRunner += filledQty
+    seenClosedTrades := strategy.closedtrades
+float qtyEpsilon = syminfo.mincontract*0.000001
+ACTIVE_tp1Done := not na(ACTIVE_qtyTp1) and ACTIVE_closedTp1 >= ACTIVE_qtyTp1-qtyEpsilon
+ACTIVE_runnerDone := not na(ACTIVE_qtyRunner) and ACTIVE_closedRunner >= ACTIVE_qtyRunner-qtyEpsilon
+bool justFilled = strategy.position_size != 0 and strategy.position_size[1] == 0
+bool justFlat = strategy.position_size == 0 and (strategy.position_size[1] != 0 or (closedThisBar and not na(ACTIVE_submitBar)))
+if justFilled
+    ACTIVE_entry := strategy.position_avg_price
+    ACTIVE_entryBar := strategy.opentrades.entry_bar_index(0)
+    ACTIVE_entryTime := strategy.opentrades.entry_time(0)
+    float actualRiskDistance = ACTIVE_direction == 1 ? ACTIVE_entry-ACTIVE_stop : ACTIVE_stop-ACTIVE_entry
+    float actualReward = ACTIVE_direction == 1 ? ACTIVE_tp1-ACTIVE_entry : ACTIVE_entry-ACTIVE_tp1
+    float actualUnitRisk = strategy.convert_to_account((actualRiskDistance+RISK_slippageTicks*syminfo.mintick)*syminfo.pointvalue+(math.abs(ACTIVE_entry)+math.abs(ACTIVE_stop))*syminfo.pointvalue*RISK_feePct/100.0)
+    ACTIVE_fillFault := na(actualUnitRisk) or actualRiskDistance <= 0 or actualReward <= 0 or actualReward/actualRiskDistance < RISK_minR or actualUnitRisk*math.abs(strategy.position_size) > ACTIVE_riskBudget*(1.0+1e-6)
+if justFlat
+    strategy.cancel_all()
+    ACTIVE_entry := na
+    ACTIVE_stop := na
+    ACTIVE_tp1 := na
+    ACTIVE_runnerTarget := na
+    ACTIVE_direction := 0
+    ACTIVE_entryBar := na
+    ACTIVE_protectedSwing := na
+    ACTIVE_qtyTp1 := na
+    ACTIVE_qtyRunner := na
+    ACTIVE_closedTp1 := 0
+    ACTIVE_closedRunner := 0
+    ACTIVE_tp1Done := false
+    ACTIVE_runnerDone := false
+    ACTIVE_targetReached := false
+    ACTIVE_submitBar := na
+    ACTIVE_entryTime := na
+    ACTIVE_riskBudget := na
+    ACTIVE_fillFault := false
+    ACTIVE_softSubmitted := false
+if strategy.position_size == 0 and not na(ACTIVE_submitBar) and bar_index > ACTIVE_submitBar and not justFlat
+    strategy.cancel_all()
+    ACTIVE_direction := 0
+    ACTIVE_entry := na
+    ACTIVE_stop := na
+    ACTIVE_tp1 := na
+    ACTIVE_runnerTarget := na
+    ACTIVE_entryBar := na
+    ACTIVE_protectedSwing := na
+    ACTIVE_qtyTp1 := na
+    ACTIVE_qtyRunner := na
+    ACTIVE_submitBar := na
+    ACTIVE_entryTime := na
+    ACTIVE_riskBudget := na
+    ACTIVE_fillFault := false
+    ACTIVE_softSubmitted := false
+    lastDecision := R023_SUBMIT_UNOBSERVED
+    lastDecisionTime := time_close
+
+// Never replace a position that completed intrabar before its first observed open state.
+if (approvedLong or approvedShort) and not closedThisBar
+    float step = f_qty_step()
+    float part = f_round_step(quantity*RISK_tp1Percent/100.0,step)
+    float remainder = math.max(0.0,quantity-part)
+    if part < step or remainder < step
+        // Unsplittable position: keep a full runner; never silently take all at TP1.
+        part := 0.0
+        remainder := quantity
+    ACTIVE_entry := signalEntry
+    ACTIVE_stop := stopPrice
+    ACTIVE_tp1 := tp1Price
+    ACTIVE_runnerTarget := math.round_to_mintick(runnerTarget)
+    ACTIVE_direction := signalDirection
+    ACTIVE_entryBar := bar_index
+    ACTIVE_protectedSwing := signalStructuralStop
+    ACTIVE_entryTime := time_close
+    ACTIVE_riskBudget := strategy.equity*RISK_percent/100.0
+    ACTIVE_fillFault := false
+    ACTIVE_softSubmitted := false
+    ACTIVE_qtyTp1 := part
+    ACTIVE_qtyRunner := remainder
+    ACTIVE_closedTp1 := 0
+    ACTIVE_closedRunner := 0
+    ACTIVE_tp1Done := false
+    ACTIVE_runnerDone := remainder <= 0
+    ACTIVE_targetReached := false
+    ACTIVE_submitBar := bar_index
+    lastSubmittedCycle := pendingCycle
+    lastSubmitBar := bar_index
+    if approvedLong
+        strategy.entry("ICC-L",strategy.long,qty=quantity,alert_message="ICC v0.4.0 long market fill")
+    else
+        strategy.entry("ICC-S",strategy.short,qty=quantity,alert_message="ICC v0.4.0 short market fill")
+
+bool livePosition = strategy.position_size != 0
+if livePosition and (not justFilled or bar_index > ACTIVE_entryBar)
+    ACTIVE_targetReached := ACTIVE_targetReached or (ACTIVE_direction == 1 ? high >= ACTIVE_tp1 : low <= ACTIVE_tp1)
+bool allowFineExit = not CFG_runnerAfterTarget or ACTIVE_targetReached
+if livePosition and allowFineExit
+    if ACTIVE_direction == 1 and not na(LTF_pivotLow) and bar_index-CFG_entryPivot > ACTIVE_entryBar and LTF_pivotLow > ACTIVE_protectedSwing and LTF_pivotLow < close
+        ACTIVE_protectedSwing := LTF_pivotLow
+    if ACTIVE_direction == -1 and not na(LTF_pivotHigh) and bar_index-CFG_entryPivot > ACTIVE_entryBar and LTF_pivotHigh < ACTIVE_protectedSwing and LTF_pivotHigh > close
+        ACTIVE_protectedSwing := LTF_pivotHigh
+bool longStructureExit = livePosition and ACTIVE_direction == 1 and close < ACTIVE_protectedSwing
+bool shortStructureExit = livePosition and ACTIVE_direction == -1 and close > ACTIVE_protectedSwing
+bool timeExit = livePosition and RISK_maxHoldHours > 0 and not na(ACTIVE_entryTime) and time_close-ACTIVE_entryTime >= RISK_maxHoldHours*3600000
+bool emergencyRiskExit = livePosition and riskLock
+bool orphanPosition = livePosition and (ACTIVE_direction == 0 or na(ACTIVE_stop) or na(ACTIVE_entry) or na(ACTIVE_protectedSwing))
+// After TP1 partial, entry >= old target is not by itself an invalid runner.
+bool fillInvalid = livePosition and not orphanPosition and (ACTIVE_fillFault or (ACTIVE_direction == 1 ? ACTIVE_entry <= ACTIVE_stop : ACTIVE_entry >= ACTIVE_stop))
+bool mustClose = longStructureExit or shortStructureExit or timeExit or emergencyRiskExit or fillInvalid or orphanPosition
+if mustClose
+    strategy.close_all(comment=orphanPosition ? "Orphan position" : fillInvalid ? "Fill stop invalid" : emergencyRiskExit ? "Risk lock" : timeExit ? "Time exit" : "Structure exit")
+else if ACTIVE_direction != 0 and (livePosition or ACTIVE_submitBar == bar_index)
+    string eid = ACTIVE_direction == 1 ? "ICC-L" : "ICC-S"
+    float remaining = livePosition ? math.abs(strategy.position_size) : quantity
+    float partLeft = math.min(remaining,math.max(0.0,ACTIVE_qtyTp1-ACTIVE_closedTp1))
+    float runnerLeft = math.max(0.0,remaining-partLeft)
+    bool softRejection = livePosition and not RISK_hardTp1 and RISK_softPartial and ACTIVE_targetReached and not ACTIVE_softSubmitted and partLeft > qtyEpsilon and (ACTIVE_direction == 1 ? close < ACTIVE_tp1 and close < close[1] : close > ACTIVE_tp1 and close > close[1])
+    if softRejection
+        strategy.cancel("ICC-TP1-X")
+        strategy.close(eid,qty=partLeft,comment="Soft TP1 rejection",immediately=true)
+        ACTIVE_softSubmitted := true
+    // Separate reduce groups: a TP1 fill cannot cancel/reduce the runner's protective stop.
+    if partLeft > qtyEpsilon and not softRejection
+        strategy.exit("ICC-TP1-X",from_entry=eid,stop=ACTIVE_stop,limit=RISK_hardTp1 ? ACTIVE_tp1 : na,qty=partLeft,oca_name="ICC-TP1-OCA")
+    if runnerLeft > qtyEpsilon
+        strategy.exit("ICC-RUN-X",from_entry=eid,stop=ACTIVE_stop,limit=RISK_runnerUseTarget ? ACTIVE_runnerTarget : na,qty=runnerLeft,oca_name="ICC-RUN-OCA")
+
+// =================================================================================================
+// VISUALS AND DIAGNOSTICS
+// =================================================================================================
+plot(DBG_showLevels ? HTF_swingHigh : na, "HTF swing high", color = color.new(color.red, 15), linewidth = 2, style = plot.style_linebr)
+plot(DBG_showLevels ? HTF_swingLow : na, "HTF swing low", color = color.new(color.teal, 15), linewidth = 2, style = plot.style_linebr)
+plot(DBG_showLevels and HTF_state != ST_NO_TRADE ? HTF_breakLevel : na, "ICC reaction level", color = color.orange, linewidth = 2, style = plot.style_linebr)
+plot(DBG_showRisk and strategy.position_size != 0 ? ACTIVE_entry : na, "Active entry", color = color.blue, linewidth = 2, style = plot.style_linebr)
+plot(DBG_showRisk and strategy.position_size != 0 ? ACTIVE_stop : na, "Active stop", color = color.red, linewidth = 2, style = plot.style_linebr)
+plot(DBG_showRisk and strategy.position_size != 0 ? ACTIVE_tp1 : na, "Active TP1", color = color.green, linewidth = 2, style = plot.style_linebr)
+plot(DBG_showRisk and RISK_runnerUseTarget and strategy.position_size != 0 ? ACTIVE_runnerTarget : na, "Runner target", color = color.new(color.green, 50), linewidth = 1, style = plot.style_linebr)
+
+plotshape(DBG_showStages and HTF_indicationEvent and not HTF_indicationEvent[1], title = "Indication", text = "IND", style = shape.circle, location = location.abovebar, color = color.orange, textcolor = color.white, size = size.tiny)
+plotshape(DBG_showStages and HTF_correctionEvent and not HTF_correctionEvent[1], title = "Correction", text = "CORR", style = shape.square, location = location.belowbar, color = color.gray, textcolor = color.white, size = size.tiny)
+plotshape(approvedLong, title = "ICC Long", text = "ICC L", style = shape.triangleup, location = location.belowbar, color = color.teal, textcolor = color.white, size = size.small)
+plotshape(approvedShort, title = "ICC Short", text = "ICC S", style = shape.triangledown, location = location.abovebar, color = color.red, textcolor = color.white, size = size.small)
+plotshape(DBG_showReject and continuationCandidate and rejectReason != REASON_ACCEPTED, title = "Rejected setup", text = "X", style = shape.xcross, location = location.top, color = color.gray, size = size.tiny)
+
+bgcolor(not tfContractOk ? color.new(color.red, 88) : not CFG_confirmed ? color.new(color.orange, 92) : na, title = "Contract warning")
+
+var table dashboard = table.new(position.top_right, 2, 14, border_width = 1)
+if DBG_showTable and barstate.islast
+    string stateText = HTF_state == ST_NO_TRADE ? "NO_TRADE" : HTF_state == ST_INDICATION ? "INDICATION" : HTF_state == ST_CORRECTION ? "CORRECTION" : "CONTINUATION"
+    string dirText = HTF_direction == DIR_LONG ? "BULLISH" : HTF_direction == DIR_SHORT ? "BEARISH" : "-"
+    string modelText = not ML_enabled ? "OFF - BASELINE" : not modelReady ? "MODEL NOT READY" : not modelVersionOk ? "VERSION FAULT" : not probabilityUsable ? "ABSTAIN" : str.tostring(modelProbability, "0.000")
+    table.cell(dashboard, 0, 0, "ICC Strategy", bgcolor = color.rgb(23,54,93), text_color = color.white)
+    table.cell(dashboard, 1, 0, STRATEGY_VERSION, bgcolor = color.rgb(23,54,93), text_color = color.white)
+    table.cell(dashboard, 0, 1, "Mode")
+    table.cell(dashboard, 1, 1, CFG_confirmed ? "CONFIRMED" : "ENTRIES DISABLED", bgcolor = color.new(CFG_confirmed ? color.green : color.red, 65))
+    table.cell(dashboard, 0, 2, "TF Contract")
+    table.cell(dashboard, 1, 2, tfContractOk ? "OK" : "FAULT", bgcolor = color.new(tfContractOk ? color.green : color.red, 65))
+    table.cell(dashboard, 0, 3, "HTF State")
+    table.cell(dashboard, 1, 3, stateText)
+    table.cell(dashboard, 0, 4, "Direction")
+    table.cell(dashboard, 1, 4, dirText)
+    table.cell(dashboard, 0, 5, "Bias / HTF / LTF")
+    table.cell(dashboard, 1, 5, str.tostring(BIAS_trend) + " / " + str.tostring(HTF_trend) + " / " + str.tostring(LTF_trend))
+    table.cell(dashboard, 0, 6, "Equal extreme")
+    table.cell(dashboard, 1, 6, HTF_equalRecent or LTF_equalRecent ? (CFG_blockEquals ? "ENG BLOCK" : "CONTEXT ONLY") : "CLEAR")
+    table.cell(dashboard, 0, 7, "Session")
+    table.cell(dashboard, 1, 7, inNewYork ? "NEW YORK" : inLondon ? "LONDON" : "OUT")
+    table.cell(dashboard, 0, 8, "ML")
+    table.cell(dashboard, 1, 8, modelText)
+    table.cell(dashboard, 0, 9, "Feature contract")
+    table.cell(dashboard, 1, 9, FEATURE_VERSION)
+    table.cell(dashboard, 0, 10, "Last decision")
+    table.cell(dashboard, 1, 10, na(lastDecisionTime) ? "WAITING" : f_reason_text(lastDecision))
+    table.cell(dashboard, 0, 11, "Daily return")
+    table.cell(dashboard, 1, 11, str.tostring(dailyReturnPct, "0.00") + "%")
+    table.cell(dashboard, 0, 12, "Weekly return")
+    table.cell(dashboard, 1, 12, str.tostring(weeklyReturnPct, "0.00") + "%")
+    table.cell(dashboard, 0, 13, "Risk lock")
+    table.cell(dashboard, 1, 13, riskLock ? "LOCKED" : "OPEN", bgcolor = color.new(riskLock ? color.red : color.green, 65))
+
+// Data Window exports. These plots do not clutter the chart.
+plot(probabilityUsable ? modelProbability : na, "ML probability", display = display.data_window)
+plot(rewardRisk, "Signal reward/risk", display = display.data_window)
+plot(entryDriftAtr, "Signal entry drift ATR", display = display.data_window)
+plot(float(rejectReason), "Decision reason code", display = display.data_window)
+plot(FEAT_01, "F01 HTF trend", display = display.data_window)
+plot(FEAT_02, "F02 Bias trend", display = display.data_window)
+plot(FEAT_03, "F03 Nested direction or LTF trend", display = display.data_window)
+plot(FEAT_04, "F04 TF alignment", display = display.data_window)
+plot(FEAT_05, "F05 Equal extreme", display = display.data_window)
+plot(FEAT_06, "F06 Direction", display = display.data_window)
+plot(FEAT_07, "F07 Leg ATR", display = display.data_window)
+plot(FEAT_08, "F08 Correction depth", display = display.data_window)
+plot(FEAT_09, "F09 Entry drift ATR", display = display.data_window)
+plot(FEAT_10, "F10 Stop ATR", display = display.data_window)
+plot(FEAT_11, "F11 Target ATR", display = display.data_window)
+plot(FEAT_12, "F12 Reward/risk", display = display.data_window)
+plot(FEAT_13, "F13 Nested setup duration", display = display.data_window)
+plot(FEAT_14, "F14 Nested event age", display = display.data_window)
+plot(FEAT_15, "F15 Session class", display = display.data_window)
+plot(FEAT_16, "F16 Confirmed correction age", display = display.data_window)
+
+// JSON export is a DECISION event, not a guarantee of a broker fill. Use order-fill alerts separately.
+f_json_string(string x) =>
+    string a = str.replace_all(x,"\\","\\\\")
+    string b = str.replace_all(a,"\"","\\\"")
+    string c = str.replace_all(b,"\n","\\n")
+    string d = str.replace_all(c,"\r","\\r")
+    str.replace_all(d,"\t","\\t")
+f_json_number(float x) =>
+    na(x) ? "null" : str.tostring(x)
+if continuationCandidate and barstate.isconfirmed
+    string features = "["+f_json_number(FEAT_01)+","+f_json_number(FEAT_02)+","+f_json_number(FEAT_03)+","+f_json_number(FEAT_04)+","+f_json_number(FEAT_05)+","+f_json_number(FEAT_06)+","+f_json_number(FEAT_07)+","+f_json_number(FEAT_08)+","+f_json_number(FEAT_09)+","+f_json_number(FEAT_10)+","+f_json_number(FEAT_11)+","+f_json_number(FEAT_12)+","+f_json_number(FEAT_13)+","+f_json_number(FEAT_14)+","+f_json_number(FEAT_15)+","+f_json_number(FEAT_16)+"]"
+    string payload = '{"schema":"'+ALERT_SCHEMA+'","strategy_version":"'+STRATEGY_VERSION+'","method_version":"'+METHOD_VERSION+'","feature_version":"'+FEATURE_VERSION+'","model_version":"'+f_json_string(ML_modelVersion)+'","symbol":"'+f_json_string(syminfo.tickerid)+'","timeframe":"'+timeframe.period+'","time":'+str.tostring(time_close)+',"cycle_id":'+str.tostring(pendingCycle)+',"direction":'+str.tostring(signalDirection)+',"reason":"'+f_reason_text(rejectReason)+'","entry_estimate":'+f_json_number(signalEntry)+',"reference":'+f_json_number(signalReference)+',"stop":'+f_json_number(stopPrice)+',"target":'+f_json_number(tp1Price)+',"quantity":'+f_json_number(quantity)+',"probability":'+(probabilityUsable ? f_json_number(modelProbability) : "null")+',"features":'+features+'}'
+    string config = '"markup_tf":"'+CFG_markupTf+'","bias_tf":"'+CFG_biasTf+'","body_levels":'+str.tostring(CFG_useBodies)+',"markup_pivot":'+str.tostring(CFG_markupPivot)+',"entry_pivot":'+str.tostring(CFG_entryPivot)+',"session_tz":"'+CFG_sessionTz+'","london":"'+CFG_london+'","new_york":"'+CFG_newYork+'","bias_veto":'+str.tostring(CFG_useBias)+',"strict_markup":'+str.tostring(CFG_strictMarkup)+',"session_filter":'+str.tostring(CFG_useSession)+',"chase_filter":'+str.tostring(CFG_useChase)+',"hard_tp1":'+str.tostring(RISK_hardTp1)+',"soft_partial":'+str.tostring(RISK_softPartial)+',"htf_reference":'+f_json_number(pendingRef)+',"protected_origin":'+f_json_number(pendingProtectedOrigin)+',"correction_start":'+f_json_number(float(pendingCorrectionTime))+',"nested_event_bar":'+f_json_number(float(lastAttemptEvent))
+    payload := str.substring(payload,0,str.length(payload)-1)+',"configuration":{'+config+'}}'
+    alert(payload,alert.freq_once_per_bar_close)
+
+// RELEASE v0.4.0: protected-origin correction validity; complete nested reset; fresh structural
+// entry trigger; retryable rejection; soft partial on target rejection; actual-fill checks;
+// separate structural body and protective wick; optional filters; v4 features require retraining.
+// LIMITS: visual swing significance, session-count recency, full three-TF hierarchy,
+// scaling and structure-only entry profiles remain unresolved. See release notes.
+// No native Pine compilation, emulator testing, or new fidelity score is claimed.

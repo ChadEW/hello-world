@@ -1,0 +1,323 @@
+//@version=6
+// ============================================================================
+//  ICT 2022 MENTORSHIP MODEL — Strategy  (Michael J. Huddleston)
+//  Pine v6 match to ICT_2022Model_EA_v1.mq5
+//
+//  STRICT ICT ONLY. No ICC correction/continuation, no MA/RSI, no invented
+//  rules. Sequence enforced every setup:
+//    1. DAILY BIAS  (D1 structure + previous-day equilibrium / PD array)
+//    2. KILL ZONE   (London / NY AM / Silver Bullet, America/New_York)
+//    3. LIQUIDITY SWEEP (raid of swing pool or PDH/PDL, close back inside)
+//    4. MSS via DISPLACEMENT (breaks structure AND leaves a Fair Value Gap)
+//    5. OTE ENTRY   (fib sweep-wick 1.0 -> displacement 0.0; 0.62-0.705-0.79)
+//    6. STOP beyond the sweep wick ; TARGET opposite liquidity (ERL)
+// ============================================================================
+strategy("ICT 2022 Model Strategy v1", overlay=true,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100, pyramiding=0, calc_on_every_tick=false,
+     process_orders_on_close=true)
+
+// ----------------------------------------------------------------------------
+//  INPUTS
+// ----------------------------------------------------------------------------
+grpGen   = "General"
+riskPct       = input.float(1.0,  "Risk per trade (%)",          group=grpGen, minval=0.1)
+maxTradesDay  = input.int(2,      "Max entries per day",          group=grpGen, minval=1)
+manualBiasIn  = input.int(0,      "Manual bias (0=auto,1=long,-1=short)", group=grpGen, minval=-1, maxval=1)
+useAutoBias   = input.bool(true,  "Auto daily bias (D1 struct + PD eq)",  group=grpGen)
+
+grpKZ    = "Kill Zones (America/New_York)"
+tzNY          = "America/New_York"
+useLondon     = input.bool(true,  "London Open KZ 02:00-05:00",   group=grpKZ)
+useNYAM       = input.bool(true,  "New York AM KZ 08:30-11:00",   group=grpKZ)
+useSilver     = input.bool(true,  "Silver Bullet 10:00-11:00",    group=grpKZ)
+
+grpLiq   = "Liquidity Sweep"
+swingLB       = input.int(12,     "Swing pool lookback",          group=grpLiq, minval=2)
+usePDHPDL     = input.bool(true,  "Include Previous Day High/Low", group=grpLiq)
+sweepMinPips  = input.float(1.0,  "Min penetration beyond level (pips)", group=grpLiq)
+
+grpMSS   = "Displacement / MSS / FVG"
+mssLB         = input.int(6,      "MSS structure lookback",       group=grpMSS, minval=2)
+minDispPips   = input.float(8.0,  "Min displacement candle range (pips)", group=grpMSS)
+minFVGpips    = input.float(1.0,  "Min Fair Value Gap size (pips)", group=grpMSS)
+setupExpiry   = input.int(12,     "Cancel setup if unfilled (bars)", group=grpMSS, minval=1)
+
+grpOTE   = "OTE / Entry (ICT Fibonacci)"
+oteStart      = input.float(0.62,  "OTE zone start",              group=grpOTE)
+oteOptimal    = input.float(0.705, "OTE sweet spot (mean threshold)", group=grpOTE)
+oteEnd        = input.float(0.79,  "OTE zone end",                group=grpOTE)
+entryAtOpt    = input.bool(true,   "Limit at 0.705 (else mid of zone)", group=grpOTE)
+requireFVGov  = input.bool(true,   "OTE must sit inside displacement FVG", group=grpOTE)
+
+grpST    = "Stops & Targets"
+stopBufPips   = input.float(2.0,  "Buffer beyond sweep wick (pips)", group=grpST)
+targetMode    = input.string("Opposite Liquidity", "Target mode",
+                     options=["Opposite Liquidity","RR Multiple","Std-Dev Projection"], group=grpST)
+rrMultiple    = input.float(3.0,  "RR multiple (mode=RR)",        group=grpST)
+stdDevProj    = input.float(2.0,  "Std-dev projection (mode=StdDev)", group=grpST)
+
+grpViz   = "Visuals"
+showFib       = input.bool(true,  "Draw OTE fib & FVG",           group=grpViz)
+showDash      = input.bool(true,  "Show dashboard",               group=grpViz)
+
+// ----------------------------------------------------------------------------
+//  PIP SIZE
+// ----------------------------------------------------------------------------
+// Pip = 10 minticks on 5- or 3-digit symbols (e.g. EURUSD, XAUUSD), else 1 mintick.
+pip = (syminfo.mintick == 0.00001 or syminfo.mintick == 0.001) ? syminfo.mintick * 10 : syminfo.mintick
+
+// ----------------------------------------------------------------------------
+//  1. DAILY BIAS  (HTF D1 structure + previous-day equilibrium)
+// ----------------------------------------------------------------------------
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+d1h1 = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+d1h2 = request.security(syminfo.tickerid, "D", high[2], lookahead=barmerge.lookahead_on)
+d1l1 = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+d1l2 = request.security(syminfo.tickerid, "D", low[2],  lookahead=barmerge.lookahead_on)
+
+computeBias() =>
+    eq = (pdh + pdl) / 2.0
+    px = close
+    structBias = (d1h1 > d1h2 and d1l1 > d1l2) ? 1 : (d1h1 < d1h2 and d1l1 < d1l2) ? -1 : 0
+    pdBias = px < eq ? 1 : px > eq ? -1 : 0
+    (structBias != 0 and structBias == pdBias) ? structBias : structBias != 0 ? structBias : 0
+
+dailyBias = useAutoBias ? computeBias() : manualBiasIn
+
+// ----------------------------------------------------------------------------
+//  2. KILL ZONE  (New York local time)
+// ----------------------------------------------------------------------------
+inSession(sH, sM, eH, eM) =>
+    t  = hour(time, tzNY) * 60 + minute(time, tzNY)
+    s  = sH * 60 + sM
+    e  = eH * 60 + eM
+    t >= s and t < e
+
+inLondon = useLondon and inSession(2, 0, 5, 0)
+inNYAM   = useNYAM   and inSession(8, 30, 11, 0)
+inSilver = useSilver and inSession(10, 0, 11, 0)
+inKZ     = inLondon or inNYAM or inSilver
+
+// ----------------------------------------------------------------------------
+//  STATE
+// ----------------------------------------------------------------------------
+var int    state       = 0        // 0 idle, 1 swept, 2 armed
+var int    setupDir    = 0
+var float  sweepWick   = na
+var float  dispExtreme = na
+var float  fvgTop      = na
+var float  fvgBot      = na
+var int    setupBar    = 0
+var float  oteEntry    = na
+var float  oteSL       = na
+var float  oteTP       = na
+var int    tradesToday = 0
+var int    lastDay     = na
+var line   fibLo = na, fibOpt = na, fibHi = na
+var box    fvgBox = na
+
+resetSetup() =>
+    state       := 0
+    setupDir    := 0
+    sweepWick   := na
+    dispExtreme := na
+    fvgTop      := na
+    fvgBot      := na
+    setupBar    := 0
+    oteEntry    := na
+    oteSL       := na
+    oteTP       := na
+
+// daily counter roll
+curDay = dayofmonth(time, tzNY)
+if curDay != lastDay
+    lastDay := curDay
+    tradesToday := 0
+
+// ----------------------------------------------------------------------------
+//  3. LIQUIDITY SWEEP  (raid of swing pool / PDH-PDL, close back inside)
+// ----------------------------------------------------------------------------
+poolHigh = ta.highest(high[1], swingLB)
+poolLow  = ta.lowest(low[1],  swingLB)
+poolHighEff = usePDHPDL ? math.max(poolHigh, pdh) : poolHigh
+poolLowEff  = usePDHPDL ? math.min(poolLow,  pdl) : poolLow
+
+buf = sweepMinPips * pip
+sweptHighs = (high > poolHighEff + buf) and (close < poolHighEff)   // buy-side raid -> short
+sweptLows  = (low  < poolLowEff  - buf) and (close > poolLowEff)    // sell-side raid -> long
+
+// ----------------------------------------------------------------------------
+//  4. MSS + DISPLACEMENT + FVG (evaluated on closed bar)
+// ----------------------------------------------------------------------------
+structHigh = ta.highest(high, mssLB)
+structLow  = ta.lowest(low,  mssLB)
+range1     = (high - low) / pip
+displaced  = range1 >= minDispPips
+
+// Bullish FVG: low[0] > high[2]   |  Bearish FVG: high[0] < low[2]
+bullFVGgap = (low - high[2]) / pip
+bearFVGgap = (low[2] - high) / pip
+
+canTrade = barstate.isconfirmed and inKZ and (tradesToday < maxTradesDay) and (strategy.opentrades == 0)
+
+// --- state machine ---
+if canTrade and state == 0
+    if sweptLows and dailyBias >= 0
+        setupDir  := 1
+        sweepWick := low
+        state     := 1
+        setupBar  := 0
+    else if sweptHighs and dailyBias <= 0
+        setupDir  := -1
+        sweepWick := high
+        state     := 1
+        setupBar  := 0
+
+else if state == 1
+    setupBar += 1
+    if setupBar > setupExpiry
+        resetSetup()
+    else if inKZ
+        if setupDir == 1
+            mssUp = (close > structHigh) and (close > open) and displaced
+            if mssUp and bullFVGgap >= minFVGpips
+                fvgBot      := high[2]
+                fvgTop      := low
+                dispExtreme := high
+                state       := 2
+        else if setupDir == -1
+            mssDown = (close < structLow) and (close < open) and displaced
+            if mssDown and bearFVGgap >= minFVGpips
+                fvgTop      := low[2]
+                fvgBot      := high
+                dispExtreme := low
+                state       := 2
+    else
+        resetSetup()
+
+// ----------------------------------------------------------------------------
+//  5/6. OTE ENTRY + STOP + TARGET  (arm limit on the bar MSS confirmed)
+// ----------------------------------------------------------------------------
+computeTarget(dir, entry, sl, dist) =>
+    risk = math.abs(entry - sl)
+    tgt = 0.0
+    if targetMode == "RR Multiple"
+        tgt := dir == 1 ? entry + rrMultiple * risk : entry - rrMultiple * risk
+    else if targetMode == "Std-Dev Projection"
+        proj = math.abs(stdDevProj) * dist
+        tgt := dir == 1 ? sweepWick + proj : sweepWick - proj
+    else
+        if dir == 1
+            oppo = ta.highest(high, swingLB * 2)
+            t = math.max(oppo, pdh)
+            tgt := t > entry ? t : entry + rrMultiple * risk
+        else
+            oppo = ta.lowest(low, swingLB * 2)
+            t = math.min(oppo, pdl)
+            tgt := t < entry ? t : entry - rrMultiple * risk
+    tgt
+
+if state == 2 and na(oteEntry)
+    lo   = math.min(sweepWick, dispExtreme)
+    hi   = math.max(sweepWick, dispExtreme)
+    dist = hi - lo
+    if dist > 0
+        entry = 0.0
+        sl    = 0.0
+        valid = true
+        if setupDir == 1
+            zS = dispExtreme - oteStart * dist
+            zE = dispExtreme - oteEnd   * dist
+            entry := entryAtOpt ? (dispExtreme - oteOptimal * dist) : (zS + zE) / 2.0
+            if requireFVGov and not (entry <= fvgTop and entry >= fvgBot)
+                if entry > fvgTop
+                    entry := fvgTop
+                else
+                    valid := false
+            sl := sweepWick - stopBufPips * pip
+        else
+            zS = dispExtreme + oteStart * dist
+            zE = dispExtreme + oteEnd   * dist
+            entry := entryAtOpt ? (dispExtreme + oteOptimal * dist) : (zS + zE) / 2.0
+            if requireFVGov and not (entry <= fvgTop and entry >= fvgBot)
+                if entry < fvgBot
+                    entry := fvgBot
+                else
+                    valid := false
+            sl := sweepWick + stopBufPips * pip
+
+        if valid
+            tp = computeTarget(setupDir, entry, sl, dist)
+            oteEntry := entry
+            oteSL    := sl
+            oteTP    := tp
+
+            // position sizing by % risk
+            slPips = math.abs(entry - sl) / pip
+            riskMoney = strategy.equity * (riskPct / 100.0)
+            qty = slPips > 0 ? riskMoney / (slPips * (pip / syminfo.mintick) * syminfo.pointvalue) : na
+
+            if setupDir == 1
+                strategy.entry("ICT_L", strategy.long, limit=entry, qty=qty)
+                strategy.exit("ICT_L_x", "ICT_L", stop=sl, limit=tp)
+            else
+                strategy.entry("ICT_S", strategy.short, limit=entry, qty=qty)
+                strategy.exit("ICT_S_x", "ICT_S", stop=sl, limit=tp)
+
+            if showFib
+                line.delete(fibLo)
+                line.delete(fibOpt)
+                line.delete(fibHi)
+                box.delete(fvgBox)
+                lvl62  = setupDir == 1 ? dispExtreme - oteStart*dist   : dispExtreme + oteStart*dist
+                lvl705 = setupDir == 1 ? dispExtreme - oteOptimal*dist : dispExtreme + oteOptimal*dist
+                lvl79  = setupDir == 1 ? dispExtreme - oteEnd*dist     : dispExtreme + oteEnd*dist
+                fibHi  := line.new(bar_index, lvl62,  bar_index + setupExpiry, lvl62,  color=color.new(color.teal,0), style=line.style_dotted)
+                fibOpt := line.new(bar_index, lvl705, bar_index + setupExpiry, lvl705, color=color.orange, width=2)
+                fibLo  := line.new(bar_index, lvl79,  bar_index + setupExpiry, lvl79,  color=color.new(color.teal,0), style=line.style_dotted)
+                fvgBox := box.new(bar_index-2, fvgTop, bar_index, fvgBot, border_color=color.new(color.blue,50), bgcolor=color.new(color.blue,90))
+
+// count fills & free engine for next A+ setup
+if state == 2 and strategy.opentrades > 0
+    tradesToday += 1
+    resetSetup()
+
+// expire unfilled pending when KZ ends
+if state == 2 and not inKZ and strategy.opentrades == 0
+    strategy.cancel("ICT_L")
+    strategy.cancel("ICT_S")
+    resetSetup()
+
+// ----------------------------------------------------------------------------
+//  VISUALS
+// ----------------------------------------------------------------------------
+plot(showFib ? poolHighEff : na, "BSL pool", color=color.new(color.red,60), style=plot.style_stepline)
+plot(showFib ? poolLowEff  : na, "SSL pool", color=color.new(color.green,60), style=plot.style_stepline)
+bgcolor(inKZ ? color.new(color.yellow, 92) : na, title="Kill Zone shade")
+
+// ----------------------------------------------------------------------------
+//  DASHBOARD
+// ----------------------------------------------------------------------------
+if showDash and barstate.islast
+    var table dash = table.new(position.top_right, 2, 7, border_width=1)
+    biasTxt  = dailyBias == 1 ? "BULLISH" : dailyBias == -1 ? "BEARISH" : "NONE"
+    biasCol  = dailyBias == 1 ? color.lime : dailyBias == -1 ? color.red : color.silver
+    stateTxt = state == 0 ? "IDLE (await sweep)" : state == 1 ? "SWEPT (await MSS+FVG)" : "ARMED (OTE set)"
+    nyTxt    = str.format("{0,number,00}:{1,number,00} NY", hour(time, tzNY), minute(time, tzNY))
+
+    table.cell(dash, 0, 0, "ICT 2022 MODEL", text_color=color.black, bgcolor=color.gold, text_size=size.normal)
+    table.cell(dash, 1, 0, "", bgcolor=color.gold)
+    table.cell(dash, 0, 1, "NY time",  text_color=color.white)
+    table.cell(dash, 1, 1, nyTxt + (inKZ ? "  [KZ]" : ""), text_color=inKZ ? color.lime : color.silver)
+    table.cell(dash, 0, 2, "Bias",     text_color=color.white)
+    table.cell(dash, 1, 2, biasTxt,    text_color=biasCol)
+    table.cell(dash, 0, 3, "State",    text_color=color.white)
+    table.cell(dash, 1, 3, stateTxt,   text_color=color.white)
+    table.cell(dash, 0, 4, "Trades",   text_color=color.white)
+    table.cell(dash, 1, 4, str.tostring(tradesToday) + "/" + str.tostring(maxTradesDay), text_color=color.white)
+    table.cell(dash, 0, 5, "Sweep",    text_color=color.white)
+    table.cell(dash, 1, 5, na(sweepWick) ? "-" : str.tostring(sweepWick, format.mintick), text_color=color.white)
+    table.cell(dash, 0, 6, "OTE/SL/TP",text_color=color.white)
+    table.cell(dash, 1, 6, na(oteEntry) ? "-" : str.tostring(oteEntry, format.mintick) + " / " + str.tostring(oteSL, format.mintick) + " / " + str.tostring(oteTP, format.mintick), text_color=color.white)

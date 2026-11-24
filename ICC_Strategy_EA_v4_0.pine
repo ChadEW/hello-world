@@ -1,0 +1,428 @@
+//@version=6
+// =====================================================================
+//  ICC_Strategy_EA_v4_0.pine
+//  Pine v6 STRATEGY port of ICC_Strategy_EA_v4_0.mq5
+//  ICC v4.0 — Sci D1->H4->H1->M15 Cascade + broker-style risk logic
+//  Built for Chad Woodyard, July 2026
+//
+//  Mirrors the MQL5 EA:
+//    • Four-TF pure-structure cascade (D1 -> H4 -> H1 -> M15)
+//    • SCI_PURE entry (M15 close through last H1 swing, cascade aligned)
+//    • Smart SL (MAX of structural / ATR), RR-based TP
+//    • Trailing stop + break-even
+//    • Optional NY session filter
+//    • Sci-style blue/red swing rays + HH/HL/LH/LL labels
+//    • Correction-zone rectangle + cascade dashboard
+//
+//  PLUS — BODY-CLOSE SUPPORT / RESISTANCE:
+//    • A level is confirmed only where candle BODIES (closes) land inside
+//      a tolerance zone at least N times (default 3).
+//    • Each level lives 3 calendar days OR 3 trading sessions
+//      (selectable), then is auto-removed.
+// =====================================================================
+strategy("ICC Strategy EA v4.0",
+     shorttitle       = "ICC-EA v4.0",
+     overlay          = true,
+     initial_capital  = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value= 100,
+     pyramiding       = 0,
+     calc_on_every_tick = false,
+     max_lines_count  = 500,
+     max_labels_count = 500,
+     max_boxes_count  = 500)
+
+// ---------- INPUTS: Cascade ------------------------------------------
+grpTF     = "Timeframe Cascade (D1 -> H4 -> H1 -> M15)"
+biasTF    = input.timeframe("D",    "Top bias TF (Indication)",  group = grpTF)
+midTF     = input.timeframe("240",  "Mid TF (Correction map)",   group = grpTF)
+workTF    = input.timeframe("60",   "Working TF (Continuation)", group = grpTF)
+trigTF    = input.timeframe("15",   "Trigger TF (Entry timing)", group = grpTF)
+strictAlign = input.bool(true, "Require ALL four TFs to agree", group = grpTF)
+cascadeSwingLen = input.int(5, "Cascade pivot length (bars L/R)", minval = 2, group = grpTF)
+
+// ---------- INPUTS: Structure / visuals ------------------------------
+grpStruct = "Structure / Swing Detection"
+swingLen  = input.int(5,    "Chart swing pivot length (bars L/R)", minval = 2, group = grpStruct)
+showLabels= input.bool(true,"Show HH / HL / LH / LL labels",   group = grpStruct)
+maxSwings = input.int(6,    "Max recent swing lines kept",     minval = 2, maxval=20, group = grpStruct)
+
+grpCol    = "Color Scheme (Sci style)"
+colHigh   = input.color(color.new(#1E88E5, 0), "Swing High (sellers' line)", group = grpCol)
+colLow    = input.color(color.new(#E53935, 0), "Swing Low (buyers' line)",   group = grpCol)
+colBull   = input.color(color.new(color.green,80), "Bullish correction zone", group = grpCol)
+colBear   = input.color(color.new(color.red,  80), "Bearish correction zone", group = grpCol)
+colNeutral= input.color(color.new(color.gray, 85), "Neutral / unclear zone",  group = grpCol)
+
+// ---------- INPUTS: Risk / management --------------------------------
+grpRisk   = "Risk / Stops (v3.3-style)"
+slMethod  = input.string("SMART", "SL method", options = ["STRUCTURAL","ATR","SMART"], group = grpRisk)
+atrLen    = input.int(14,    "ATR period",         minval = 1, group = grpRisk)
+atrMult   = input.float(1.5, "ATR multiplier",     minval = 0.1, step = 0.1, group = grpRisk)
+slBufPips = input.float(5.0, "Structural SL buffer (pips)", minval = 0.0, step = 0.5, group = grpRisk)
+rrRatio   = input.float(2.0, "Reward:Risk ratio",  minval = 0.1, step = 0.1, group = grpRisk)
+
+grpTrail  = "Trailing / Break-even (pips)"
+useTrail  = input.bool(true,  "Use trailing stop", group = grpTrail)
+trailStart= input.float(20.0, "Trailing start (pips profit)", minval = 0.0, group = grpTrail)
+trailStep = input.float(10.0, "Trailing distance (pips)",     minval = 0.1, group = grpTrail)
+useBE     = input.bool(true,  "Use break-even",    group = grpTrail)
+beAt      = input.float(15.0, "Break-even trigger (pips profit)", minval = 0.0, group = grpTrail)
+beProfit  = input.float(1.0,  "Break-even locked profit (pips)",  minval = 0.0, group = grpTrail)
+
+grpSess   = "Session Filter"
+useNYHrs  = input.bool(false, "Restrict entries to NY session (09:00-16:00 NY)", group = grpSess)
+
+// ---------- INPUTS: Body-close S/R -----------------------------------
+grpSR     = "Support / Resistance (body-close levels)"
+srShow    = input.bool(true,  "Show body-close S/R levels",              group = grpSR)
+srMinTouch= input.int(3,      "Min body closes to confirm a level",       minval = 2, group = grpSR)
+srTolPips = input.float(10.0, "Zone tolerance (pips)",                    minval = 0.1, step = 0.5, group = grpSR)
+srDurMode = input.string("Calendar Days", "Level duration unit",
+     options = ["Calendar Days", "Trading Sessions"], group = grpSR)
+srDurN    = input.int(3,      "Level duration (days or sessions)",        minval = 1, group = grpSR)
+srColRes  = input.color(color.new(color.orange, 0), "Resistance color",  group = grpSR)
+srColSup  = input.color(color.new(color.teal,   0), "Support color",     group = grpSR)
+srUseZone = input.bool(true,  "Draw as shaded zone (box) instead of line",group = grpSR)
+srShowCnt = input.bool(true,  "Show touch-count label",                  group = grpSR)
+srRefLen  = input.int(20,     "Reference SMA length (S/R classifier)",    minval = 5, group = grpSR)
+
+// ---------- PIP HELPER -----------------------------------------------
+pip = syminfo.mintick * (str.contains(syminfo.type, "forex") ? 10 : 1)
+
+// ---------- CASCADE BIAS ENGINE --------------------------------------
+// Returns +1 = bullish (HH+HL), -1 = bearish (LH+LL), 0 = unclear
+f_bias(_tf) =>
+    [ph1, pl1] = request.security(syminfo.tickerid, _tf,
+         [ta.pivothigh(cascadeSwingLen, cascadeSwingLen), ta.pivotlow(cascadeSwingLen, cascadeSwingLen)],
+         lookahead = barmerge.lookahead_off)
+    var float lastH1 = na, var float prevH1 = na
+    var float lastL1 = na, var float prevL1 = na
+    if not na(ph1)
+        prevH1 := lastH1
+        lastH1 := ph1
+    if not na(pl1)
+        prevL1 := lastL1
+        lastL1 := pl1
+    b = 0
+    if not na(lastH1) and not na(prevH1) and not na(lastL1) and not na(prevL1)
+        b := (lastH1 > prevH1 and lastL1 > prevL1) ? 1 :
+             (lastH1 < prevH1 and lastL1 < prevL1) ? -1 : 0
+    b
+
+biasD1 = f_bias(biasTF)
+biasH4 = f_bias(midTF)
+biasH1 = f_bias(workTF)
+biasM15= f_bias(trigTF)
+
+fullAlignBull = strictAlign ? (biasD1==1  and biasH4==1  and biasH1==1  and biasM15==1)
+                            : (biasH1==1  and biasM15==1)
+fullAlignBear = strictAlign ? (biasD1==-1 and biasH4==-1 and biasH1==-1 and biasM15==-1)
+                            : (biasH1==-1 and biasM15==-1)
+
+// ---------- WORKING-TF SWINGS (entry ref + SL anchor) ----------------
+var float wkLastHi = na, var float wkPrevHi = na
+var float wkLastLo = na, var float wkPrevLo = na
+wkHi = request.security(syminfo.tickerid, workTF, ta.pivothigh(cascadeSwingLen, cascadeSwingLen),
+     lookahead = barmerge.lookahead_off)
+wkLo = request.security(syminfo.tickerid, workTF, ta.pivotlow (cascadeSwingLen, cascadeSwingLen),
+     lookahead = barmerge.lookahead_off)
+if not na(wkHi)
+    wkPrevHi := wkLastHi
+    wkLastHi := wkHi
+if not na(wkLo)
+    wkPrevLo := wkLastLo
+    wkLastLo := wkLo
+
+trigClose = request.security(syminfo.tickerid, trigTF, close, lookahead = barmerge.lookahead_off)
+
+// ---------- SCI-STYLE CHART MARKING ----------------------------------
+phChart = ta.pivothigh(swingLen, swingLen)
+plChart = ta.pivotlow (swingLen, swingLen)
+
+var line[]  hiLines  = array.new<line>()
+var line[]  loLines  = array.new<line>()
+var label[] hiLabels = array.new<label>()
+var label[] loLabels = array.new<label>()
+
+f_trim(arr, lblArr, maxN) =>
+    while array.size(arr) > maxN
+        line.delete(array.shift(arr))
+        if array.size(lblArr) > 0
+            label.delete(array.shift(lblArr))
+
+if not na(phChart)
+    px = high[swingLen]
+    ln = line.new(bar_index[swingLen], px, bar_index, px,
+         color = colHigh, width = 2, extend = extend.right, style = line.style_solid)
+    array.push(hiLines, ln)
+    if showLabels
+        var float prevHi = na
+        tag = na(prevHi) ? "H" : (px > prevHi ? "HH" : "LH")
+        lb = label.new(bar_index[swingLen], px, tag,
+             style = label.style_label_down, color = colHigh,
+             textcolor = color.white, size = size.tiny)
+        array.push(hiLabels, lb)
+        prevHi := px
+    f_trim(hiLines, hiLabels, maxSwings)
+
+if not na(plChart)
+    px = low[swingLen]
+    ln = line.new(bar_index[swingLen], px, bar_index, px,
+         color = colLow, width = 2, extend = extend.right, style = line.style_solid)
+    array.push(loLines, ln)
+    if showLabels
+        var float prevLo = na
+        tag = na(prevLo) ? "L" : (px > prevLo ? "HL" : "LL")
+        lb = label.new(bar_index[swingLen], px, tag,
+             style = label.style_label_up, color = colLow,
+             textcolor = color.white, size = size.tiny)
+        array.push(loLabels, lb)
+        prevLo := px
+    f_trim(loLines, loLabels, maxSwings)
+
+// ---------- CORRECTION ZONE BOX --------------------------------------
+var box corrBox = na
+zoneCol = biasH1 == 1 ? colBull : biasH1 == -1 ? colBear : colNeutral
+if not na(phChart) or not na(plChart)
+    topPx = not na(wkLastHi) ? wkLastHi : high
+    botPx = not na(wkLastLo) ? wkLastLo : low
+    if not na(corrBox)
+        box.delete(corrBox)
+    corrBox := box.new(bar_index - 30, topPx, bar_index + 10, botPx,
+         border_color = color.new(color.gray, 60), bgcolor = zoneCol, extend = extend.right)
+
+// =====================================================================
+//  MODULE: BODY-CLOSE SUPPORT / RESISTANCE ENGINE
+// =====================================================================
+srTol = srTolPips * pip
+
+var int sessCount = 0
+if ta.change(time("D")) != 0
+    sessCount += 1
+
+srRef = ta.sma(close, srRefLen)
+
+var float[] srPrice   = array.new_float()
+var int[]   srCount   = array.new_int()
+var int[]   srBirthMs = array.new_int()
+var int[]   srBirthSes= array.new_int()
+var int[]   srBirthBar= array.new_int()
+var bool[]  srIsRes   = array.new_bool()
+var line[]  srLine    = array.new<line>()
+var box[]   srBox     = array.new<box>()
+var label[] srLbl     = array.new<label>()
+
+f_srExpired(i) =>
+    exp = false
+    if srDurMode == "Calendar Days"
+        exp := (time - array.get(srBirthMs, i)) >= srDurN * 86400000
+    else
+        exp := (sessCount - array.get(srBirthSes, i)) >= srDurN
+    exp
+
+f_srRemove(i) =>
+    ln = array.get(srLine, i)
+    if not na(ln)
+        line.delete(ln)
+    bx = array.get(srBox, i)
+    if not na(bx)
+        box.delete(bx)
+    lb = array.get(srLbl, i)
+    if not na(lb)
+        label.delete(lb)
+    array.remove(srPrice, i)
+    array.remove(srCount, i)
+    array.remove(srBirthMs, i)
+    array.remove(srBirthSes, i)
+    array.remove(srBirthBar, i)
+    array.remove(srIsRes, i)
+    array.remove(srLine, i)
+    array.remove(srBox, i)
+    array.remove(srLbl, i)
+
+if barstate.isconfirmed
+    c = close
+    if array.size(srPrice) > 0
+        for i = array.size(srPrice) - 1 to 0
+            if f_srExpired(i)
+                f_srRemove(i)
+    matched = false
+    if array.size(srPrice) > 0
+        for i = 0 to array.size(srPrice) - 1
+            if math.abs(c - array.get(srPrice, i)) <= srTol
+                newCount = array.get(srCount, i) + 1
+                newPrice = (array.get(srPrice, i) * array.get(srCount, i) + c) / newCount
+                array.set(srCount, i, newCount)
+                array.set(srPrice, i, newPrice)
+                matched := true
+                if newCount == srMinTouch and srShow
+                    isRes  = newPrice >= srRef
+                    array.set(srIsRes, i, isRes)
+                    col    = isRes ? srColRes : srColSup
+                    bBar   = array.get(srBirthBar, i)
+                    if srUseZone
+                        bx = box.new(bBar, newPrice + srTol / 2, bar_index, newPrice - srTol / 2,
+                             border_color = col, bgcolor = color.new(col, 82))
+                        array.set(srBox, i, bx)
+                    else
+                        ln = line.new(bBar, newPrice, bar_index, newPrice,
+                             color = col, width = 2, style = line.style_solid)
+                        array.set(srLine, i, ln)
+                    if srShowCnt
+                        lb = label.new(bar_index, newPrice,
+                             (isRes ? "R x" : "S x") + str.tostring(newCount),
+                             style = isRes ? label.style_label_down : label.style_label_up,
+                             color = col, textcolor = color.white, size = size.tiny)
+                        array.set(srLbl, i, lb)
+                else if newCount > srMinTouch and srShow and srShowCnt
+                    lb = array.get(srLbl, i)
+                    if not na(lb)
+                        isRes = array.get(srIsRes, i)
+                        label.set_text(lb, (isRes ? "R x" : "S x") + str.tostring(newCount))
+                        label.set_xy(lb, bar_index, newPrice)
+                break
+    if not matched
+        array.push(srPrice, c)
+        array.push(srCount, 1)
+        array.push(srBirthMs, time)
+        array.push(srBirthSes, sessCount)
+        array.push(srBirthBar, bar_index)
+        array.push(srIsRes, false)
+        array.push(srLine, na)
+        array.push(srBox, na)
+        array.push(srLbl, na)
+        if array.size(srPrice) > 60
+            f_srRemove(0)
+
+if srShow and array.size(srLine) > 0
+    for i = 0 to array.size(srLine) - 1
+        ln = array.get(srLine, i)
+        if not na(ln)
+            line.set_x2(ln, bar_index)
+        bx = array.get(srBox, i)
+        if not na(bx)
+            box.set_right(bx, bar_index)
+
+// =====================================================================
+//  ENTRY / EXIT LOGIC (SCI_PURE)
+// =====================================================================
+// ATR for smart stops
+atrVal = ta.atr(atrLen)
+
+// Session filter
+nySession = not useNYHrs or (hour(time, "America/New_York") >= 9
+                          and hour(time, "America/New_York") <  16)
+
+// Continuation triggers: trigger-TF close through last counter-swing
+buyContinuation  = fullAlignBull and not na(wkLastHi) and trigClose > wkLastHi and nySession
+sellContinuation = fullAlignBear and not na(wkLastLo) and trigClose < wkLastLo and nySession
+
+// Fire only on the bar where condition flips true
+buySig  = buyContinuation  and not buyContinuation[1]
+sellSig = sellContinuation and not sellContinuation[1]
+
+// ----- Smart SL distance -----
+f_slDist(isLong) =>
+    structDist = isLong ? (close - nz(wkLastLo, close)) : (nz(wkLastHi, close) - close)
+    structDist := math.max(structDist, 0) + slBufPips * pip
+    atrDist    = atrVal * atrMult
+    d = slMethod == "STRUCTURAL" ? structDist :
+        slMethod == "ATR"        ? atrDist    :
+        math.max(structDist, atrDist)   // SMART
+    math.max(d, 5 * pip)
+
+// ----- Entries with SL/TP -----
+if buySig and strategy.position_size == 0
+    slDist = f_slDist(true)
+    slPx   = close - slDist
+    tpPx   = close + slDist * rrRatio
+    strategy.entry("Long", strategy.long)
+    strategy.exit("L-exit", "Long", stop = slPx, limit = tpPx)
+
+if sellSig and strategy.position_size == 0
+    slDist = f_slDist(false)
+    slPx   = close + slDist
+    tpPx   = close - slDist * rrRatio
+    strategy.entry("Short", strategy.short)
+    strategy.exit("S-exit", "Short", stop = slPx, limit = tpPx)
+
+// ----- Break-even + trailing management -----
+var float trailSL = na
+if strategy.position_size > 0
+    entryPx = strategy.position_avg_price
+    profit  = close - entryPx
+    // break-even
+    beStop  = useBE and profit >= beAt * pip ? entryPx + beProfit * pip : na
+    // trailing
+    trStop  = useTrail and profit >= trailStart * pip ? close - trailStep * pip : na
+    newSL   = na(beStop) ? trStop : (na(trStop) ? beStop : math.max(beStop, trStop))
+    if not na(newSL)
+        trailSL := na(trailSL) ? newSL : math.max(trailSL, newSL)
+    if not na(trailSL)
+        strategy.exit("L-trail", "Long", stop = trailSL,
+             limit = entryPx + f_slDist(true) * rrRatio)
+else if strategy.position_size < 0
+    entryPx = strategy.position_avg_price
+    profit  = entryPx - close
+    beStop  = useBE and profit >= beAt * pip ? entryPx - beProfit * pip : na
+    trStop  = useTrail and profit >= trailStart * pip ? close + trailStep * pip : na
+    newSL   = na(beStop) ? trStop : (na(trStop) ? beStop : math.min(beStop, trStop))
+    if not na(newSL)
+        trailSL := na(trailSL) ? newSL : math.min(trailSL, newSL)
+    if not na(trailSL)
+        strategy.exit("S-trail", "Short", stop = trailSL,
+             limit = entryPx - f_slDist(false) * rrRatio)
+else
+    trailSL := na
+
+// ----- Entry arrows (visual) -----
+plotshape(buySig,  title="BUY Continuation",  style = shape.triangleup,
+     location = location.belowbar, color = color.new(color.lime, 0), size = size.small, text = "ICC^")
+plotshape(sellSig, title="SELL Continuation", style = shape.triangledown,
+     location = location.abovebar, color = color.new(color.red, 0), size = size.small, text = "ICCv")
+
+// =====================================================================
+//  DASHBOARD
+// =====================================================================
+var table dash = table.new(position.top_right, 2, 7, border_width = 1)
+f_biasTxt(b) => b ==  1 ? "^ BULL" : b == -1 ? "v BEAR" : "- flat"
+f_biasCol(b) => b ==  1 ? color.new(color.green, 70) :
+                b == -1 ? color.new(color.red,   70) :
+                          color.new(color.gray,  70)
+f_srActive() =>
+    cnt = 0
+    if array.size(srCount) > 0
+        for i = 0 to array.size(srCount) - 1
+            if array.get(srCount, i) >= srMinTouch
+                cnt += 1
+    cnt
+
+if barstate.islast
+    table.cell(dash, 0, 0, "TF",   bgcolor=color.new(color.black,70), text_color=color.white)
+    table.cell(dash, 1, 0, "Bias", bgcolor=color.new(color.black,70), text_color=color.white)
+    table.cell(dash, 0, 1, biasTF, text_color=color.white)
+    table.cell(dash, 1, 1, f_biasTxt(biasD1),  bgcolor=f_biasCol(biasD1))
+    table.cell(dash, 0, 2, midTF,  text_color=color.white)
+    table.cell(dash, 1, 2, f_biasTxt(biasH4),  bgcolor=f_biasCol(biasH4))
+    table.cell(dash, 0, 3, workTF, text_color=color.white)
+    table.cell(dash, 1, 3, f_biasTxt(biasH1),  bgcolor=f_biasCol(biasH1))
+    table.cell(dash, 0, 4, trigTF, text_color=color.white)
+    table.cell(dash, 1, 4, f_biasTxt(biasM15), bgcolor=f_biasCol(biasM15))
+    aligned = fullAlignBull ? "^ ALIGNED LONG" :
+              fullAlignBear ? "v ALIGNED SHORT" : "x NOT ALIGNED"
+    aCol    = fullAlignBull ? color.new(color.green,40) :
+              fullAlignBear ? color.new(color.red,  40) :
+                              color.new(color.gray, 40)
+    table.cell(dash, 0, 5, "Cascade", text_color=color.white)
+    table.cell(dash, 1, 5, aligned, bgcolor=aCol, text_color=color.white)
+    table.cell(dash, 0, 6, "S/R lvls", text_color=color.white)
+    table.cell(dash, 1, 6, str.tostring(f_srActive()), text_color=color.white)
+
+// =====================================================================
+//  ALERTS
+// =====================================================================
+alertcondition(buySig,  "ICC BUY Continuation",
+     '{"symbol":"{{ticker}}","tf":"{{interval}}","side":"BUY","price":{{close}},"strategy":"ICC-EA-v4"}')
+alertcondition(sellSig, "ICC SELL Continuation",
+     '{"symbol":"{{ticker}}","tf":"{{interval}}","side":"SELL","price":{{close}},"strategy":"ICC-EA-v4"}')

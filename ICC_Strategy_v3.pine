@@ -1,0 +1,659 @@
+// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=6
+strategy("ICC Strategy v3.0 — MTF Confluence", 
+     overlay=true, 
+     margin_long=100, margin_short=100,
+     default_qty_type=strategy.percent_of_equity, 
+     default_qty_value=1,
+     initial_capital=10000,
+     pyramiding=1,
+     commission_type=strategy.commission.percent, 
+     commission_value=0.01,
+     slippage=2,
+     process_orders_on_close=false)
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║                    INPUT PARAMETERS                          ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// === Auto-Timeframe Settings ===
+grp_auto = "⚙️ Auto-Timeframe Settings"
+autoSettings = input.bool(true, "Auto-adapt settings to timeframe", group=grp_auto)
+
+// === ICC Structure (manual overrides) ===
+grp_icc = "📐 ICC Structure (Manual Override)"
+swingLookback_in  = input.int(5, "Swing Lookback", minval=2, maxval=20, group=grp_icc)
+corrMinPct_in     = input.float(30.0, "Min Correction %", minval=10, maxval=60, group=grp_icc)
+corrMaxPct_in     = input.float(79.0, "Max Correction %", minval=50, maxval=95, group=grp_icc)
+rrRatio_in        = input.float(2.0, "Reward:Risk Ratio", minval=0.5, maxval=10, step=0.1, group=grp_icc)
+slBuffer_in       = input.int(50, "SL Buffer (points)", minval=5, maxval=500, group=grp_icc)
+
+// === Multi-Timeframe Confluence ===
+grp_mtf = "🔭 Multi-Timeframe Confluence"
+useMTF            = input.bool(true, "Enable MTF Confluence Filter", group=grp_mtf)
+mtfMode           = input.string("Auto", "MTF Mode", options=["Auto", "Manual"], group=grp_mtf)
+manualHTF1        = input.timeframe("240", "Manual HTF1", group=grp_mtf)
+manualHTF2        = input.timeframe("D", "Manual HTF2", group=grp_mtf)
+requireBothHTF    = input.bool(false, "Require BOTH HTFs aligned", group=grp_mtf)
+htfSwingLookback  = input.int(7, "HTF Swing Lookback", minval=2, maxval=20, group=grp_mtf)
+allowCounterTrend = input.bool(false, "Allow counter-trend trades", group=grp_mtf)
+tpBoostPct        = input.float(25.0, "TP Boost % on full confluence", minval=0, maxval=100, group=grp_mtf)
+
+// === Trade Management ===
+grp_trade = "💰 Trade Management"
+riskPercent       = input.float(1.0, "Risk per trade (%)", minval=0.1, maxval=10, group=grp_trade)
+
+// === Trailing Stop ===
+grp_trail = "📐 Trailing Stop"
+useTrailing       = input.bool(true, "Enable Trailing Stop", group=grp_trail)
+trailStart_in     = input.int(200, "Trailing Start (pts)", minval=10, group=grp_trail)
+trailStep_in      = input.int(100, "Trailing Step (pts)", minval=10, group=grp_trail)
+
+// === Break Even ===
+grp_be = "🔒 Break Even"
+useBreakEven      = input.bool(true, "Enable Break-Even", group=grp_be)
+beAt_in           = input.int(150, "BE Trigger (pts)", minval=10, group=grp_be)
+beProfit_in       = input.int(10, "BE Lock Profit (pts)", minval=0, group=grp_be)
+
+// === Session Filter ===
+grp_sess = "🕐 Session Filter"
+useSession        = input.bool(false, "Enable Session Filter", group=grp_sess)
+sessStart         = input.session("0200-1700", "Session Window", group=grp_sess)
+
+// === Visual Settings ===
+grp_vis = "🎨 Visual Settings"
+showSwings        = input.bool(true, "Show Swing Points", group=grp_vis)
+showPhaseLabels   = input.bool(true, "Show Phase Labels", group=grp_vis)
+showDashboard     = input.bool(true, "Show Dashboard", group=grp_vis)
+showHTFZones      = input.bool(true, "Show HTF S/R Zones", group=grp_vis)
+bullColor         = input.color(color.new(#1E90FF, 0), "Bull Color", group=grp_vis)
+bearColor         = input.color(color.new(#FF4500, 0), "Bear Color", group=grp_vis)
+corrColor         = input.color(color.new(#FFD700, 0), "Correction Color", group=grp_vis)
+htfBullZone       = input.color(color.new(#3CB371, 75), "HTF Bull Zone", group=grp_vis)
+htfBearZone       = input.color(color.new(#DC143C, 75), "HTF Bear Zone", group=grp_vis)
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║              AUTO-CONFIGURE PER TIMEFRAME                    ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+tfMinutes = timeframe.in_seconds() / 60
+
+// Auto-detect settings based on chart timeframe
+swingLookback = autoSettings ? (tfMinutes <= 5 ? 3 : tfMinutes <= 15 ? 3 : tfMinutes <= 60 ? 5 : tfMinutes <= 240 ? 7 : 10) : swingLookback_in
+corrMinPct    = autoSettings ? (tfMinutes <= 5 ? 25.0 : tfMinutes <= 15 ? 30.0 : tfMinutes <= 60 ? 30.0 : 38.0) : corrMinPct_in
+corrMaxPct    = autoSettings ? (tfMinutes <= 5 ? 65.0 : tfMinutes <= 15 ? 70.0 : 79.0) : corrMaxPct_in
+rrRatio       = autoSettings ? (tfMinutes <= 5 ? 1.2 : tfMinutes <= 15 ? 1.5 : tfMinutes <= 60 ? 2.0 : tfMinutes <= 240 ? 3.0 : 3.5) : rrRatio_in
+slBuffer      = autoSettings ? (tfMinutes <= 5 ? 20 : tfMinutes <= 15 ? 30 : tfMinutes <= 60 ? 50 : tfMinutes <= 240 ? 100 : 200) : slBuffer_in
+trailStart    = autoSettings ? (tfMinutes <= 5 ? 80 : tfMinutes <= 15 ? 120 : tfMinutes <= 60 ? 200 : tfMinutes <= 240 ? 400 : 800) : trailStart_in
+trailStep     = autoSettings ? (tfMinutes <= 5 ? 40 : tfMinutes <= 15 ? 60 : tfMinutes <= 60 ? 100 : tfMinutes <= 240 ? 200 : 400) : trailStep_in
+beAt          = autoSettings ? (tfMinutes <= 5 ? 60 : tfMinutes <= 15 ? 100 : tfMinutes <= 60 ? 150 : tfMinutes <= 240 ? 300 : 600) : beAt_in
+beProfit      = autoSettings ? (tfMinutes <= 5 ? 5 : tfMinutes <= 15 ? 8 : tfMinutes <= 60 ? 10 : tfMinutes <= 240 ? 20 : 50) : beProfit_in
+
+activeProfile = autoSettings ? (tfMinutes <= 5 ? "M5 SCALP" : tfMinutes <= 15 ? "M15 SCALP" : tfMinutes <= 60 ? "H1 INTRADAY" : tfMinutes <= 240 ? "H4 SWING" : "D1 POSITION") : "MANUAL"
+
+// Point size
+pointSize = syminfo.mintick
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║                  AUTO MTF TIMEFRAME SELECTION                ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// Auto-select HTF1 (trend confirmation)
+autoHTF1() =>
+    if tfMinutes <= 5
+        "15"
+    else if tfMinutes <= 15
+        "60"
+    else if tfMinutes <= 60
+        "240"
+    else if tfMinutes <= 240
+        "D"
+    else
+        "W"
+
+// Auto-select HTF2 (structural/macro bias)
+autoHTF2() =>
+    if tfMinutes <= 5
+        "60"
+    else if tfMinutes <= 15
+        "240"
+    else if tfMinutes <= 60
+        "D"
+    else if tfMinutes <= 240
+        "W"
+    else
+        "M"
+
+htf1_tf = mtfMode == "Auto" ? autoHTF1() : manualHTF1
+htf2_tf = mtfMode == "Auto" ? autoHTF2() : manualHTF2
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║              SWING POINT DETECTION (ENTRY TF)                ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// Swing High: highest high within lookback window on both sides
+isSwingHigh(idx) =>
+    result = true
+    for i = 1 to swingLookback
+        if high[idx - i] >= high[idx] or high[idx + i] >= high[idx]
+            result := false
+            break
+    result
+
+isSwingLow(idx) =>
+    result = true
+    for i = 1 to swingLookback
+        if low[idx - i] <= low[idx] or low[idx + i] <= low[idx]
+            result := false
+            break
+    result
+
+// Check confirmed swing at position swingLookback (needs future bars to confirm)
+swHighConfirmed = isSwingHigh(swingLookback)
+swLowConfirmed  = isSwingLow(swingLookback)
+
+// Track last two swing highs and swing lows
+var float lastSH  = na
+var float prevSH  = na
+var float lastSL  = na
+var float prevSL  = na
+var int   lastSH_bar = na
+var int   lastSL_bar = na
+
+if swHighConfirmed
+    if na(lastSH) or high[swingLookback] != lastSH
+        prevSH  := lastSH
+        lastSH  := high[swingLookback]
+        lastSH_bar := bar_index - swingLookback
+
+if swLowConfirmed
+    if na(lastSL) or low[swingLookback] != lastSL
+        prevSL  := lastSL
+        lastSL  := low[swingLookback]
+        lastSL_bar := bar_index - swingLookback
+
+// Draw swing points
+plotshape(showSwings and swHighConfirmed ? high[swingLookback] : na, 
+     title="Swing High", style=shape.triangledown, location=location.abovebar, 
+     color=bearColor, size=size.tiny, offset=-swingLookback)
+plotshape(showSwings and swLowConfirmed ? low[swingLookback] : na, 
+     title="Swing Low", style=shape.triangleup, location=location.belowbar, 
+     color=bullColor, size=size.tiny, offset=-swingLookback)
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║                   MARKET STRUCTURE                           ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+var int currentTrend = 0   // 0=none, 1=bull, -1=bear
+var int previousTrend = 0
+
+higherHigh = not na(lastSH) and not na(prevSH) and lastSH > prevSH
+higherLow  = not na(lastSL) and not na(prevSL) and lastSL > prevSL
+lowerLow   = not na(lastSL) and not na(prevSL) and lastSL < prevSL
+lowerHigh  = not na(lastSH) and not na(prevSH) and lastSH < prevSH
+
+if higherHigh and higherLow
+    previousTrend := currentTrend
+    currentTrend  := 1
+else if lowerLow and lowerHigh
+    previousTrend := currentTrend
+    currentTrend  := -1
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║            HTF MARKET STRUCTURE ANALYSIS                     ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// Robust HTF trend detection: structure (swing HH/HL/LH/LL) + EMA confirmation
+htfStructureTrend(htfTf, lookback) =>
+    // Get HTF candle data (no lookahead to prevent future leak)
+    htfH = request.security(syminfo.tickerid, htfTf, high, lookahead=barmerge.lookahead_off)
+    htfL = request.security(syminfo.tickerid, htfTf, low, lookahead=barmerge.lookahead_off)
+    htfC = request.security(syminfo.tickerid, htfTf, close, lookahead=barmerge.lookahead_off)
+    
+    // EMA-based trend on HTF for robustness
+    htfEmaFast = request.security(syminfo.tickerid, htfTf, ta.ema(close, 21), lookahead=barmerge.lookahead_off)
+    htfEmaSlow = request.security(syminfo.tickerid, htfTf, ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+    
+    // Recent swing high/low on HTF
+    htfSwH     = request.security(syminfo.tickerid, htfTf, ta.highest(high, lookback * 2), lookahead=barmerge.lookahead_off)
+    htfSwL     = request.security(syminfo.tickerid, htfTf, ta.lowest(low, lookback * 2), lookahead=barmerge.lookahead_off)
+    htfPrevSwH = request.security(syminfo.tickerid, htfTf, ta.highest(high, lookback * 2)[lookback * 2], lookahead=barmerge.lookahead_off)
+    htfPrevSwL = request.security(syminfo.tickerid, htfTf, ta.lowest(low, lookback * 2)[lookback * 2], lookahead=barmerge.lookahead_off)
+    
+    // Combine structure + EMA for trend
+    structureBull = htfSwH > htfPrevSwH and htfSwL > htfPrevSwL
+    structureBear = htfSwH < htfPrevSwH and htfSwL < htfPrevSwL
+    emaBull = htfEmaFast > htfEmaSlow
+    emaBear = htfEmaFast < htfEmaSlow
+    
+    trend = 0
+    if structureBull or (emaBull and htfSwL > htfPrevSwL)
+        trend := 1
+    else if structureBear or (emaBear and htfSwH < htfPrevSwH)
+        trend := -1
+    
+    [trend, htfSwH, htfSwL]
+
+// Get HTF trends
+[htf1Trend, htf1SwH, htf1SwL] = htfStructureTrend(htf1_tf, htfSwingLookback)
+[htf2Trend, htf2SwH, htf2SwL] = htfStructureTrend(htf2_tf, htfSwingLookback)
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║               MTF CONFLUENCE EVALUATION                      ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+htf1Bull = htf1Trend == 1
+htf1Bear = htf1Trend == -1
+htf2Bull = htf2Trend == 1
+htf2Bear = htf2Trend == -1
+
+mtfConfBull = useMTF ? (requireBothHTF ? (htf1Bull and htf2Bull) : htf1Bull) : true
+mtfConfBear = useMTF ? (requireBothHTF ? (htf1Bear and htf2Bear) : htf1Bear) : true
+
+fullConfBull = useMTF and htf1Bull and htf2Bull
+fullConfBear = useMTF and htf1Bear and htf2Bear
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║                    ICC PHASE DETECTION                       ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+var int   iccPhase       = 0   // 0=none, 1=indication, 2=correction, 3=continuation
+var float indicationHigh = na
+var float indicationLow  = na
+var float correctionHigh = na
+var float correctionLow  = na
+var bool  buyFired       = false
+var bool  sellFired      = false
+
+cc = close  // current close
+
+// ═══ BULLISH ICC ═══
+if currentTrend == 1
+    // INDICATION: New Higher High
+    if higherHigh and iccPhase != 2 and iccPhase != 3
+        iccPhase       := 1
+        indicationHigh := lastSH
+        indicationLow  := lastSL
+        buyFired       := false
+
+    // CORRECTION: Pullback within valid range
+    if iccPhase == 1 and not na(indicationHigh) and cc < indicationHigh
+        moveSize     = indicationHigh - indicationLow
+        pullbackPct  = moveSize > 0 ? ((indicationHigh - cc) / moveSize) * 100.0 : 0.0
+        
+        if pullbackPct >= corrMinPct and pullbackPct <= corrMaxPct
+            iccPhase       := 2
+            correctionLow  := cc
+            correctionHigh := indicationHigh
+        
+        if iccPhase == 2 and cc < correctionLow
+            newPct = moveSize > 0 ? ((indicationHigh - cc) / moveSize) * 100.0 : 0.0
+            if newPct <= corrMaxPct
+                correctionLow := cc
+            else
+                iccPhase := 0  // Invalidated
+
+    // CONTINUATION: Price resumes upward
+    if iccPhase == 2 and not na(indicationHigh) and not na(indicationLow)
+        midLevel = indicationLow + (indicationHigh - indicationLow) * 0.5
+        if cc > midLevel and cc > correctionLow and close > close[1]
+            iccPhase := 3
+
+// ═══ BEARISH ICC ═══
+if currentTrend == -1
+    // INDICATION: New Lower Low
+    if lowerLow and iccPhase != 2 and iccPhase != 3
+        iccPhase       := 1
+        indicationLow  := lastSL
+        indicationHigh := lastSH
+        sellFired      := false
+
+    // CORRECTION: Pullback up within valid range
+    if iccPhase == 1 and not na(indicationLow) and cc > indicationLow
+        moveSize     = indicationHigh - indicationLow
+        pullbackPct  = moveSize > 0 ? ((cc - indicationLow) / moveSize) * 100.0 : 0.0
+        
+        if pullbackPct >= corrMinPct and pullbackPct <= corrMaxPct
+            iccPhase       := 2
+            correctionHigh := cc
+            correctionLow  := indicationLow
+        
+        if iccPhase == 2 and cc > correctionHigh
+            newPct = moveSize > 0 ? ((cc - indicationLow) / moveSize) * 100.0 : 0.0
+            if newPct <= corrMaxPct
+                correctionHigh := cc
+            else
+                iccPhase := 0
+
+    // CONTINUATION: Price resumes downward
+    if iccPhase == 2 and not na(indicationHigh) and not na(indicationLow)
+        midLevel = indicationLow + (indicationHigh - indicationLow) * 0.5
+        if cc < midLevel and cc < correctionHigh and close < close[1]
+            iccPhase := 3
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║                  SESSION FILTER                              ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+inSession = useSession ? not na(time(timeframe.period, sessStart)) : true
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║           ENTRY SIGNALS + TRADE EXECUTION                    ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+var float entrySL = na
+var float entryTP = na
+
+// BUY CONDITIONS
+bullContinuation = iccPhase == 3 and currentTrend == 1 and not buyFired and inSession
+bullMTFPass      = useMTF ? (mtfConfBull or allowCounterTrend) : true
+bullEntry        = bullContinuation and bullMTFPass
+
+// SELL CONDITIONS
+bearContinuation = iccPhase == 3 and currentTrend == -1 and not sellFired and inSession
+bearMTFPass      = useMTF ? (mtfConfBear or allowCounterTrend) : true
+bearEntry        = bearContinuation and bearMTFPass
+
+// Calculate SL/TP for BUY
+if bullEntry and not na(correctionLow)
+    slPrice = correctionLow - slBuffer * pointSize
+    slDist  = close - slPrice
+    
+    // TP Boost for full confluence
+    boost   = fullConfBull ? (1.0 + tpBoostPct / 100.0) : 1.0
+    tpPrice = close + slDist * rrRatio * boost
+    
+    entrySL := slPrice
+    entryTP := tpPrice
+    
+    strategy.entry("ICC_BUY", strategy.long)
+    strategy.exit("BUY_EXIT", "ICC_BUY", stop=slPrice, limit=tpPrice, 
+         trail_points=useTrailing ? trailStart : na, 
+         trail_offset=useTrailing ? trailStep : na)
+    
+    buyFired := true
+    iccPhase := 0
+
+// Calculate SL/TP for SELL
+if bearEntry and not na(correctionHigh)
+    slPrice = correctionHigh + slBuffer * pointSize
+    slDist  = slPrice - close
+    
+    boost   = fullConfBear ? (1.0 + tpBoostPct / 100.0) : 1.0
+    tpPrice = close - slDist * rrRatio * boost
+    
+    entrySL := slPrice
+    entryTP := tpPrice
+    
+    strategy.entry("ICC_SELL", strategy.short)
+    strategy.exit("SELL_EXIT", "ICC_SELL", stop=slPrice, limit=tpPrice,
+         trail_points=useTrailing ? trailStart : na,
+         trail_offset=useTrailing ? trailStep : na)
+    
+    sellFired := true
+    iccPhase  := 0
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║              BREAK-EVEN MANAGEMENT                           ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+if useBreakEven and strategy.position_size > 0
+    // Long position break-even
+    profitPts = (close - strategy.position_avg_price) / pointSize
+    if profitPts >= beAt
+        newSL = strategy.position_avg_price + beProfit * pointSize
+        strategy.exit("BUY_BE", "ICC_BUY", stop=newSL, limit=entryTP,
+             trail_points=useTrailing ? trailStart : na,
+             trail_offset=useTrailing ? trailStep : na)
+
+if useBreakEven and strategy.position_size < 0
+    // Short position break-even
+    profitPts = (strategy.position_avg_price - close) / pointSize
+    if profitPts >= beAt
+        newSL = strategy.position_avg_price - beProfit * pointSize
+        strategy.exit("SELL_BE", "ICC_SELL", stop=newSL, limit=entryTP,
+             trail_points=useTrailing ? trailStart : na,
+             trail_offset=useTrailing ? trailStep : na)
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║          STRUCTURE REVERSAL EXIT WARNING                     ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+structureFlipBear = currentTrend == -1 and previousTrend == 1
+structureFlipBull = currentTrend == 1 and previousTrend == -1
+
+// Close positions on structure reversal (safety net)
+if structureFlipBear and strategy.position_size > 0
+    strategy.close("ICC_BUY", comment="Structure → Bearish")
+
+if structureFlipBull and strategy.position_size < 0
+    strategy.close("ICC_SELL", comment="Structure → Bullish")
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║                  VISUAL OVERLAYS                             ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// --- Phase Background Coloring ---
+phaseBgColor = iccPhase == 1 ? color.new(bullColor, 92) : 
+               iccPhase == 2 ? color.new(corrColor, 92) : 
+               iccPhase == 3 ? color.new(#00FF00, 88) : na
+bgcolor(phaseBgColor, title="ICC Phase Background")
+
+// --- Entry Signal Markers ---
+plotshape(bullEntry, title="BUY Signal", style=shape.labelup, 
+     location=location.belowbar, color=bullColor, 
+     text="BUY", textcolor=color.white, size=size.normal)
+
+plotshape(bearEntry, title="SELL Signal", style=shape.labeldown, 
+     location=location.abovebar, color=bearColor, 
+     text="SELL", textcolor=color.white, size=size.normal)
+
+// --- MTF Blocked Signal ---
+bullBlocked = bullContinuation and useMTF and not mtfConfBull and not allowCounterTrend
+bearBlocked = bearContinuation and useMTF and not mtfConfBear and not allowCounterTrend
+
+plotshape(bullBlocked, title="BUY Blocked", style=shape.xcross,
+     location=location.belowbar, color=color.gray, size=size.small)
+plotshape(bearBlocked, title="SELL Blocked", style=shape.xcross,
+     location=location.abovebar, color=color.gray, size=size.small)
+
+// --- SL/TP Lines ---
+plot(strategy.position_size > 0 ? entrySL : na, "Long SL", color=color.red, 
+     linewidth=1, style=plot.style_linebr)
+plot(strategy.position_size > 0 ? entryTP : na, "Long TP", color=color.green, 
+     linewidth=1, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? entrySL : na, "Short SL", color=color.red, 
+     linewidth=1, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? entryTP : na, "Short TP", color=color.green, 
+     linewidth=1, style=plot.style_linebr)
+
+// --- HTF S/R Zones ---
+var box htf1ShBox = na
+var box htf1SlBox = na
+var box htf2ShBox = na
+var box htf2SlBox = na
+
+if showHTFZones and useMTF and barstate.islast
+    // Clean up old boxes
+    if not na(htf1ShBox)
+        box.delete(htf1ShBox)
+    if not na(htf1SlBox)
+        box.delete(htf1SlBox)
+    if not na(htf2ShBox)
+        box.delete(htf2ShBox)
+    if not na(htf2SlBox)
+        box.delete(htf2SlBox)
+    
+    zonePad = syminfo.mintick * 20
+    
+    htf1ShBox := box.new(bar_index - 50, htf1SwH, bar_index + 10, htf1SwH - zonePad,
+         bgcolor=htf1Trend == 1 ? htfBullZone : htfBearZone,
+         border_color=htf1Trend == 1 ? color.green : color.red,
+         border_style=line.style_dotted,
+         text="HTF1 SH: " + str.tostring(htf1SwH, format.mintick),
+         text_size=size.tiny, text_color=color.white)
+    
+    htf1SlBox := box.new(bar_index - 50, htf1SwL + zonePad, bar_index + 10, htf1SwL,
+         bgcolor=htf1Trend == -1 ? htfBearZone : htfBullZone,
+         border_color=htf1Trend == -1 ? color.red : color.green,
+         border_style=line.style_dotted,
+         text="HTF1 SL: " + str.tostring(htf1SwL, format.mintick),
+         text_size=size.tiny, text_color=color.white)
+    
+    htf2ShBox := box.new(bar_index - 50, htf2SwH, bar_index + 10, htf2SwH - zonePad * 1.5,
+         bgcolor=htf2Trend == 1 ? htfBullZone : htfBearZone,
+         border_color=htf2Trend == 1 ? color.green : color.red,
+         border_style=line.style_dashed,
+         text="HTF2 SH: " + str.tostring(htf2SwH, format.mintick),
+         text_size=size.tiny, text_color=color.white)
+    
+    htf2SlBox := box.new(bar_index - 50, htf2SwL + zonePad * 1.5, bar_index + 10, htf2SwL,
+         bgcolor=htf2Trend == -1 ? htfBearZone : htfBullZone,
+         border_color=htf2Trend == -1 ? color.red : color.green,
+         border_style=line.style_dashed,
+         text="HTF2 SL: " + str.tostring(htf2SwL, format.mintick),
+         text_size=size.tiny, text_color=color.white)
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║                    DASHBOARD TABLE                           ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+if showDashboard and barstate.islast
+    var table dash = table.new(position.top_right, 2, 18, 
+         bgcolor=color.new(#1a1a2e, 5), 
+         border_color=color.new(#4a4a6a, 0), 
+         border_width=1,
+         frame_color=color.new(#6a6a9a, 0),
+         frame_width=2)
+    
+    // Header
+    table.cell(dash, 0, 0, "ICC v3.0", text_color=color.white, text_size=size.normal, bgcolor=color.new(#2d2d5e, 0))
+    table.cell(dash, 1, 0, "MTF Confluence", text_color=color.new(#FFD700, 0), text_size=size.normal, bgcolor=color.new(#2d2d5e, 0))
+    
+    // Profile
+    table.cell(dash, 0, 1, "Profile", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 1, activeProfile, text_color=color.white, text_size=size.small)
+    
+    // Entry Trend
+    trendStr  = currentTrend == 1 ? "BULLISH ▲" : currentTrend == -1 ? "BEARISH ▼" : "NONE"
+    trendClr  = currentTrend == 1 ? bullColor : currentTrend == -1 ? bearColor : color.gray
+    table.cell(dash, 0, 2, "Entry Trend", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 2, trendStr, text_color=trendClr, text_size=size.small)
+    
+    // Phase
+    phaseStr = iccPhase == 1 ? "1. INDICATION" : iccPhase == 2 ? "2. CORRECTION" : iccPhase == 3 ? "3. CONTINUATION" : "Scanning..."
+    phaseClr = iccPhase == 1 ? bullColor : iccPhase == 2 ? corrColor : iccPhase == 3 ? color.lime : color.gray
+    table.cell(dash, 0, 3, "Phase", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 3, phaseStr, text_color=phaseClr, text_size=size.small)
+    
+    // Separator
+    table.cell(dash, 0, 4, "── MTF ──", text_color=color.new(#6a6a9a, 0), text_size=size.small)
+    table.cell(dash, 1, 4, "────────", text_color=color.new(#6a6a9a, 0), text_size=size.small)
+    
+    // HTF1
+    htf1Str = htf1Trend == 1 ? "BULLISH ▲" : htf1Trend == -1 ? "BEARISH ▼" : "RANGING ↔"
+    htf1Clr = htf1Trend == 1 ? color.lime : htf1Trend == -1 ? color.red : color.yellow
+    table.cell(dash, 0, 5, "HTF1 (" + htf1_tf + ")", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 5, htf1Str, text_color=htf1Clr, text_size=size.small)
+    
+    // HTF2
+    htf2Str = htf2Trend == 1 ? "BULLISH ▲" : htf2Trend == -1 ? "BEARISH ▼" : "RANGING ↔"
+    htf2Clr = htf2Trend == 1 ? color.lime : htf2Trend == -1 ? color.red : color.yellow
+    table.cell(dash, 0, 6, "HTF2 (" + htf2_tf + ")", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 6, htf2Str, text_color=htf2Clr, text_size=size.small)
+    
+    // Bull/Bear Confluence
+    table.cell(dash, 0, 7, "Bull Conf", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 7, mtfConfBull ? "✅ YES" : "❌ NO", text_color=mtfConfBull ? color.lime : color.red, text_size=size.small)
+    
+    table.cell(dash, 0, 8, "Bear Conf", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 8, mtfConfBear ? "✅ YES" : "❌ NO", text_color=mtfConfBear ? color.lime : color.red, text_size=size.small)
+    
+    // Signal Grade
+    quality = "---"
+    qualClr = color.gray
+    if currentTrend == 1 and mtfConfBull
+        quality := fullConfBull ? "🟢🟢🟢 A+" : "🟢🟢 A"
+        qualClr := color.lime
+    else if currentTrend == -1 and mtfConfBear
+        quality := fullConfBear ? "🔴🔴🔴 A+" : "🔴🔴 A"
+        qualClr := color.red
+    else if currentTrend != 0
+        quality := "⚠️ B/C"
+        qualClr := color.yellow
+    
+    table.cell(dash, 0, 9, "Signal", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 9, quality, text_color=qualClr, text_size=size.small)
+    
+    // Separator
+    table.cell(dash, 0, 10, "── Settings ──", text_color=color.new(#6a6a9a, 0), text_size=size.small)
+    table.cell(dash, 1, 10, "────────", text_color=color.new(#6a6a9a, 0), text_size=size.small)
+    
+    // Swing levels
+    table.cell(dash, 0, 11, "Swing H", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 11, str.tostring(lastSH, format.mintick), text_color=color.white, text_size=size.small)
+    
+    table.cell(dash, 0, 12, "Swing L", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 12, str.tostring(lastSL, format.mintick), text_color=color.white, text_size=size.small)
+    
+    // Settings
+    table.cell(dash, 0, 13, "Lookback", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 13, str.tostring(swingLookback) + " bars", text_color=color.white, text_size=size.small)
+    
+    table.cell(dash, 0, 14, "Correction", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 14, str.tostring(corrMinPct, "#") + "% - " + str.tostring(corrMaxPct, "#") + "%", text_color=color.white, text_size=size.small)
+    
+    table.cell(dash, 0, 15, "RR Ratio", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 15, str.tostring(rrRatio, "#.#"), text_color=color.white, text_size=size.small)
+    
+    table.cell(dash, 0, 16, "SL Buffer", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 16, str.tostring(slBuffer) + " pts", text_color=color.white, text_size=size.small)
+    
+    table.cell(dash, 0, 17, "Position", text_color=color.gray, text_size=size.small)
+    posStr = strategy.position_size > 0 ? "LONG " + str.tostring(strategy.position_size, "#.##") : strategy.position_size < 0 ? "SHORT " + str.tostring(math.abs(strategy.position_size), "#.##") : "FLAT"
+    posClr = strategy.position_size > 0 ? color.lime : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(dash, 1, 17, posStr, text_color=posClr, text_size=size.small)
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║                      ALERTS                                  ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// Entry Alerts
+alertcondition(bullEntry, title="🟢 ICC BUY Signal", 
+     message="🟢 ICC BUY — {{ticker}} | {{interval}}\nEntry: {{close}} | Profile: " + activeProfile + "\nMTF Confluence: Active")
+
+alertcondition(bearEntry, title="🔴 ICC SELL Signal",
+     message="🔴 ICC SELL — {{ticker}} | {{interval}}\nEntry: {{close}} | Profile: " + activeProfile + "\nMTF Confluence: Active")
+
+// Phase Alerts
+alertcondition(iccPhase == 1 and iccPhase[1] != 1, title="📊 ICC Indication",
+     message="📊 ICC INDICATION — {{ticker}} | {{interval}}\nNew structure break detected")
+
+alertcondition(iccPhase == 2 and iccPhase[1] != 2, title="🔄 ICC Correction",
+     message="🔄 ICC CORRECTION — {{ticker}} | {{interval}}\nPullback in progress")
+
+alertcondition(iccPhase == 0 and iccPhase[1] == 2, title="❌ ICC Invalidated",
+     message="❌ ICC INVALIDATED — {{ticker}} | {{interval}}\nCorrection exceeded max depth")
+
+// MTF Blocked Alerts
+alertcondition(bullBlocked, title="🚫 BUY Blocked by MTF",
+     message="🚫 ICC BUY BLOCKED — {{ticker}}\nHTF trend not bullish. Setup rejected.")
+
+alertcondition(bearBlocked, title="🚫 SELL Blocked by MTF",
+     message="🚫 ICC SELL BLOCKED — {{ticker}}\nHTF trend not bearish. Setup rejected.")
+
+// Structure Reversal Alerts
+alertcondition(structureFlipBear, title="⚠️ Structure → Bearish",
+     message="⚠️ STRUCTURE REVERSAL — {{ticker}}\nMarket shifted BEARISH. Exit longs!")
+
+alertcondition(structureFlipBull, title="⚠️ Structure → Bullish",
+     message="⚠️ STRUCTURE REVERSAL — {{ticker}}\nMarket shifted BULLISH. Exit shorts!")
+
+// Full Confluence Alert
+alertcondition(fullConfBull and currentTrend == 1 and iccPhase == 3, title="🟢🟢🟢 A+ Bull Setup",
+     message="🟢🟢🟢 A+ FULL CONFLUENCE BUY — {{ticker}} | {{interval}}\nAll timeframes aligned bullish!")
+
+alertcondition(fullConfBear and currentTrend == -1 and iccPhase == 3, title="🔴🔴🔴 A+ Bear Setup",
+     message="🔴🔴🔴 A+ FULL CONFLUENCE SELL — {{ticker}} | {{interval}}\nAll timeframes aligned bearish!")

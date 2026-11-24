@@ -1,0 +1,736 @@
+//@version=6
+// =====================================================================
+//  ICC_TradesBySci_Strategy_v2.1.pine  —  STRATEGY PORT of EA v2.1 (+v2.2 structural TP)
+//  Sci-style Indication -> Correction -> Continuation pullback entries
+//  with a SOFT D1-WEIGHTED higher-timeframe (HTF) bias.
+//
+//  v2.1 CHANGE (see Appendix I of the operating manual):
+//    UseD1Filter is now a SOFT WEIGHT, not a hard veto.
+//    H4 still LEADS the direction; D1 adds/subtracts conviction via
+//    d1Weight. A trade is allowed only if the net HTF score stays on
+//    H4's side by >= htfMinConviction:
+//        score = biasH4 + biasD1 * d1Weight
+//    This reopens counter-D1 H4 setups (bullish H4 bounces inside a
+//    bearish daily) that the old hard veto suppressed.
+//    Backward-compat: d1Weight=1.0 + htfMinConviction=0.5 reproduces
+//    the old hard-veto behavior; d1Weight=0 (or useD1Filter off) = pure H4.
+//
+//  ENTRY PATHS (priority): 1) ICC pullback  2) retest  3) cascade breakout
+//
+//  Built for Chad Woodyard, July 2026.  v6 wrap-hardened,
+//  CW10003-safe (history refs hoisted), CE10235-safe (unified returns).
+// =====================================================================
+strategy("ICC TradesBySci Strategy v2.2", "ICC-Sci Strat v2.2", overlay = true,
+     initial_capital       = 10000,
+     default_qty_type      = strategy.percent_of_equity,
+     default_qty_value     = 100,
+     pyramiding            = 0,
+     calc_on_every_tick    = false,
+     process_orders_on_close = true,
+     max_lines_count       = 500,
+     max_labels_count      = 500,
+     max_boxes_count       = 500)
+// ============================ INPUTS: Entry Paths ===================
+grpEP     = "Entry Paths"
+useICC       = input.bool(true,  "ICC pullback entries (Indication->Correction->Continuation)", group = grpEP)
+useRetest    = input.bool(true,  "Retest-confirmation entries",  group = grpEP)
+useCascade   = input.bool(false, "Cascade BREAKOUT entries (v1 path)", group = grpEP)
+closeOnOpp   = input.bool(true,  "Close open trade on opposite signal", group = grpEP)
+// ============================ INPUTS: Bias / Filter =================
+grpBias   = "Bias / Filter (Sci: HTF sets bias, LTF entry)"
+biasLoose      = input.bool(true,  "Loosen bias: single BOS sets trend (HH w/o LL = bull)", group = grpBias)
+useD1Filter    = input.bool(true,  "Let D1 influence HTF bias as a SOFT weight", group = grpBias)
+d1Weight       = input.float(0.5,  "D1 weight vs H4 (0=ignore, 1.0=~old hard veto, >1 D1 dominates)", minval = 0.0, maxval = 3.0, step = 0.1, group = grpBias)
+htfMinConv     = input.float(0.5,  "Min net HTF score (same side as H4) required to trade", minval = 0.0, maxval = 3.0, step = 0.1, group = grpBias)
+strictAlign    = input.bool(false, "v1 lockstep: require ALL four TFs to agree", group = grpBias)
+// ============================ INPUTS: ICC Pullback ==================
+grpICC    = "ICC Pullback Tuning"
+corrRetMin   = input.float(0.500, "Min pullback into discount/premium (fib of impulse)", minval = 0.1, maxval = 0.95, step = 0.01, group = grpICC)
+corrRetMax   = input.float(0.900, "Max pullback before setup invalidates (fib)", minval = 0.2, maxval = 1.0, step = 0.01, group = grpICC)
+iccExpiry    = input.int(30, "Bars to complete Correction+Continuation", minval = 3, group = grpICC)
+iccSLbufPips = input.float(3.0, "ICC SL buffer beyond correction extreme (pips)", minval = 0.0, step = 0.5, group = grpICC)
+// ============================ INPUTS: Cascade =======================
+grpTF     = "Timeframe Cascade (D1 -> H4 -> H1 -> M15)"
+biasTF    = input.timeframe("D",   "Top bias TF (Indication filter)", group = grpTF)
+midTF     = input.timeframe("240", "Mid / primary Indication TF",     group = grpTF)
+workTF    = input.timeframe("60",  "Working TF (swing anchor)",       group = grpTF)
+trigTF    = input.timeframe("15",  "Trigger TF (Entry timing)",       group = grpTF)
+cascadeSwingLen = input.int(5, "Cascade pivot length (bars L/R)", minval = 2, group = grpTF)
+showDash  = input.bool(true, "Show cascade dashboard", group = grpTF)
+// ============================ INPUTS: Risk / Stops ==================
+grpRisk   = "Stops / Sizing"
+slMethod  = input.string("Smart", "SL method", options = ["Structural","ATR","Smart"], group = grpRisk)
+atrLen    = input.int(14,   "ATR period", minval = 1, group = grpRisk)
+atrMult   = input.float(1.5,"ATR multiplier", minval = 0.1, step = 0.1, group = grpRisk)
+slBufPips = input.float(50, "Extra structural buffer (pips)", minval = 0, step = 1, group = grpRisk)
+rrRatio   = input.float(2.0,"TP reward : risk", minval = 0.1, step = 0.1, group = grpRisk)
+useTrail  = input.bool(true, "Use trailing stop", group = grpRisk)
+trailStartPips = input.float(200, "Trailing start (pips)", minval = 0, step = 1, group = grpRisk)
+trailStepPips  = input.float(100, "Trailing distance (pips)", minval = 1, step = 1, group = grpRisk)
+useBE     = input.bool(true, "Use break-even", group = grpRisk)
+beAtPips  = input.float(150, "Break-even trigger (pips)", minval = 0, step = 1, group = grpRisk)
+beLockPips= input.float(10,  "Break-even lock profit (pips)", minval = 0, step = 1, group = grpRisk)
+// ============================ INPUTS: Take-Profit Mode (v2.2) =======
+grpTP     = "Take-Profit Mode (v2.2)"
+tpMode    = input.string("Fixed RR", "TP target", options = ["Fixed RR","Structural"], group = grpTP, tooltip = "Fixed RR = entry +/- stop*RR (v2.1). Structural = nearest un-broken S/R beyond entry (Sci: previous high / next liquidity pool).")
+tpLookback= input.int(200, "Structural: working-TF bars scanned for fallback swing target", minval = 10, group = grpTP)
+tpMinRR   = input.float(1.0, "Structural: reject/floor targets below this reward:risk", minval = 0.1, step = 0.1, group = grpTP)
+// ============================ INPUTS: Session =======================
+grpSess   = "Session Filter"
+useSession   = input.bool(false, "Restrict entries to a session", group = grpSess)
+sessionSpec  = input.session("1330-2000", "Session (exchange time)", group = grpSess)
+// ============================ INPUTS: S/R ===========================
+grpSR     = "Support / Resistance (body-close levels)"
+srShow    = input.bool(true,  "Run body-close S/R engine",               group = grpSR)
+srMinTouch= input.int(3,      "Min body closes to confirm a level",       minval = 2, group = grpSR)
+srTolPips = input.float(10.0, "Zone tolerance (pips)",                    minval = 0.1, step = 0.5, group = grpSR)
+srDurMode = input.string("Calendar Days", "Level duration unit", options = ["Calendar Days","Trading Sessions"], group = grpSR)
+srDurN    = input.int(3,      "Level duration (days or sessions)",        minval = 1, group = grpSR)
+srColRes  = input.color(color.new(color.orange, 0), "Resistance color",  group = grpSR)
+srColSup  = input.color(color.new(color.teal,   0), "Support color",     group = grpSR)
+srUseZone = input.bool(true,  "Draw as shaded zone (box) vs line",       group = grpSR)
+srShowCnt = input.bool(true,  "Show touch-count label",                  group = grpSR)
+srRefLen  = input.int(20,     "Reference SMA length (S/R classifier)",    minval = 5, group = grpSR)
+// ============================ INPUTS: Broken level ==================
+grpBrk    = "Broken-Level Behavior"
+brkMode   = input.string("Gray Out", "When a level is broken", options = ["Gray Out","Delete"], group = grpBrk, tooltip = "Retest entries require Gray Out.")
+brkBufPips= input.float(2.0, "Break buffer beyond level (pips)", minval = 0.0, step = 0.5, group = grpBrk)
+brkColor  = input.color(color.new(color.gray, 40), "Grayed-out color", group = grpBrk)
+// ============================ INPUTS: Retest ========================
+grpRe     = "Retest-Confirmation Entry"
+retestConfBufPips = input.float(1.0, "Rejection confirmation buffer (pips)", minval = 0.0, step = 0.5, group = grpRe)
+retestArmBars     = input.int(5, "Arm window (bars) after a retest", minval = 1, maxval = 50, group = grpRe)
+retestSepBar      = input.bool(true, "Require a separate confirmation bar", group = grpRe)
+retestSLbufPips   = input.float(3.0, "Retest SL buffer beyond level (pips)", minval = 0.0, step = 0.5, group = grpRe)
+// ============================ INPUTS: Swings ========================
+grpSw     = "Swing / Structure (Sci style)"
+showSwings= input.bool(true, "Draw swing high/low rays",       group = grpSw)
+swingLen  = input.int(5,     "Swing pivot length (bars L/R)",  minval = 2, group = grpSw)
+maxSwings = input.int(6,     "Max recent swing lines kept",    minval = 1, maxval = 30, group = grpSw)
+colHigh   = input.color(color.new(#1E88E5, 0), "Swing High (sellers' line)", group = grpSw)
+colLow    = input.color(color.new(#E53935, 0), "Swing Low (buyers' line)",   group = grpSw)
+// ============================ INPUTS: Diagnostics ===================
+grpDiag   = "Diagnostics"
+showICClabels = input.bool(true, "Show ICC phase labels on chart", group = grpDiag)
+// ============================ PIP / TOL =============================
+isForex = str.contains(syminfo.type, "forex")
+pip     = syminfo.mintick * (isForex ? 10 : 1)
+srTol   = srTolPips        * pip
+brkBuf  = brkBufPips       * pip
+confBuf = retestConfBufPips* pip
+slBuf   = retestSLbufPips  * pip
+slBufP  = slBufPips        * pip
+iccSLbuf= iccSLbufPips     * pip
+trailStart = trailStartPips* pip
+beAt       = beAtPips      * pip
+beLock     = beLockPips    * pip
+inSession = not useSession or not na(time(timeframe.period, sessionSpec))
+// ============================ SESSION COUNTER =======================
+var int sessCount = 0
+dayChange = ta.change(time("D"))
+if not na(dayChange) and dayChange != 0
+    sessCount += 1
+srRef = ta.sma(close, srRefLen)
+atrVal = ta.atr(atrLen)
+// ============================ CASCADE BIAS ENGINE (loosened) ========
+f_bias(_tf) =>
+    [ph1, pl1] = request.security(syminfo.tickerid, _tf, [ta.pivothigh(cascadeSwingLen, cascadeSwingLen), ta.pivotlow(cascadeSwingLen, cascadeSwingLen)], lookahead = barmerge.lookahead_off)
+    var float lastH1 = na
+    var float prevH1 = na
+    var float lastL1 = na
+    var float prevL1 = na
+    if not na(ph1)
+        prevH1 := lastH1
+        lastH1 := ph1
+    if not na(pl1)
+        prevL1 := lastL1
+        lastL1 := pl1
+    haveAll = not na(lastH1) and not na(prevH1) and not na(lastL1) and not na(prevL1)
+    hh = haveAll and lastH1 > prevH1
+    hl = haveAll and lastL1 > prevL1
+    lh = haveAll and lastH1 < prevH1
+    ll = haveAll and lastL1 < prevL1
+    b = 0
+    if biasLoose
+        b := (hh and not ll) ? 1 : (ll and not hh) ? -1 : 0
+    else
+        b := (hh and hl) ? 1 : (lh and ll) ? -1 : 0
+    b
+biasD1 = f_bias(biasTF)
+biasH4 = f_bias(midTF)
+biasH1 = f_bias(workTF)
+biasM15= f_bias(trigTF)
+strictBull = biasD1 ==  1 and biasH4 ==  1 and biasH1 ==  1 and biasM15 ==  1
+strictBear = biasD1 == -1 and biasH4 == -1 and biasH1 == -1 and biasM15 == -1
+looseBull  = biasH1 ==  1 and biasM15 ==  1
+looseBear  = biasH1 == -1 and biasM15 == -1
+alignBull  = strictAlign ? strictBull : looseBull
+alignBear  = strictAlign ? strictBear : looseBear
+// v2.1 SOFT-WEIGHTED HTF bias: H4 leads, D1 nudges conviction.
+//   score = biasH4 + biasD1 * d1Weight        (only when useD1Filter)
+//   direction returned only if score stays on H4's side by >= htfMinConv.
+//   d1Weight=1.0 + htfMinConv=0.5 reproduces the old hard veto.
+f_htfScore() =>
+    useD1Filter ? (biasH4 + biasD1 * d1Weight) : biasH4
+f_htf() =>
+    r = 0
+    sc = f_htfScore()
+    if biasH4 == 0
+        r := 0
+    else if not useD1Filter
+        r := biasH4
+    else if biasH4 == 1 and sc >= htfMinConv
+        r := 1
+    else if biasH4 == -1 and sc <= -htfMinConv
+        r := -1
+    else
+        r := 0
+    r
+htfScore = f_htfScore()
+htf = f_htf()
+// ============================ WORKING-TF SWINGS =====================
+var float wkLastHi = na
+var float wkLastLo = na
+wkHi = request.security(syminfo.tickerid, workTF, ta.pivothigh(cascadeSwingLen, cascadeSwingLen), lookahead = barmerge.lookahead_off)
+wkLo = request.security(syminfo.tickerid, workTF, ta.pivotlow (cascadeSwingLen, cascadeSwingLen), lookahead = barmerge.lookahead_off)
+if not na(wkHi)
+    wkLastHi := wkHi
+if not na(wkLo)
+    wkLastLo := wkLo
+// Last-closed working-TF extremes + trigger-TF closes/minor swings
+wkH1c = request.security(syminfo.tickerid, workTF, high[1], lookahead = barmerge.lookahead_off)
+wkL1c = request.security(syminfo.tickerid, workTF, low[1],  lookahead = barmerge.lookahead_off)
+m15c1 = request.security(syminfo.tickerid, trigTF, close[1], lookahead = barmerge.lookahead_off)
+m15h2 = request.security(syminfo.tickerid, trigTF, high[2],  lookahead = barmerge.lookahead_off)
+m15l2 = request.security(syminfo.tickerid, trigTF, low[2],   lookahead = barmerge.lookahead_off)
+// ============================ SWING RAYS ============================
+phSwing = ta.pivothigh(swingLen, swingLen)
+plSwing = ta.pivotlow (swingLen, swingLen)
+var line[] swLines = array.new<line>()
+// CW10003-safe: hoist history refs so they evaluate on EVERY bar
+xSwingLeft = bar_index[swingLen]
+hiSwing    = high[swingLen]
+loSwing    = low[swingLen]
+f_pushSwing(int x1, float px, color col) =>
+    ln = line.new(x1, px, bar_index, px, color = col, width = 2, extend = extend.right, style = line.style_solid)
+    array.push(swLines, ln)
+    while array.size(swLines) > maxSwings * 2
+        line.delete(array.shift(swLines))
+    true
+if showSwings and not na(phSwing)
+    f_pushSwing(xSwingLeft, hiSwing, colHigh)
+if showSwings and not na(plSwing)
+    f_pushSwing(xSwingLeft, loSwing, colLow)
+// ============================ S/R CLUSTER STORE =====================
+var float[] srPrice   = array.new_float()
+var int[]   srCount   = array.new_int()
+var int[]   srBirthMs = array.new_int()
+var int[]   srBirthSes= array.new_int()
+var int[]   srBirthBar= array.new_int()
+var bool[]  srIsRes   = array.new_bool()
+var bool[]  srDrawn   = array.new_bool()
+var bool[]  srBroken  = array.new_bool()
+var bool[]  srRetested= array.new_bool()
+var bool[]  srArmed   = array.new_bool()
+var int[]   srArmBar  = array.new_int()
+var line[]  srLine    = array.new<line>()
+var box[]   srBox     = array.new<box>()
+var label[] srLbl     = array.new<label>()
+f_srExpired(i) =>
+    exp = false
+    if srDurMode == "Calendar Days"
+        exp := (time - array.get(srBirthMs, i)) >= srDurN * 86400000
+    else
+        exp := (sessCount - array.get(srBirthSes, i)) >= srDurN
+    exp
+f_srRemove(i) =>
+    ln = array.get(srLine, i)
+    if not na(ln)
+        line.delete(ln)
+    bx = array.get(srBox, i)
+    if not na(bx)
+        box.delete(bx)
+    lb = array.get(srLbl, i)
+    if not na(lb)
+        label.delete(lb)
+    array.remove(srPrice, i)
+    array.remove(srCount, i)
+    array.remove(srBirthMs, i)
+    array.remove(srBirthSes, i)
+    array.remove(srBirthBar, i)
+    array.remove(srIsRes, i)
+    array.remove(srDrawn, i)
+    array.remove(srBroken, i)
+    array.remove(srRetested, i)
+    array.remove(srArmed, i)
+    array.remove(srArmBar, i)
+    array.remove(srLine, i)
+    array.remove(srBox, i)
+    array.remove(srLbl, i)
+    true
+f_srLabelText(isRes, cnt, broken) =>
+    pre = broken ? "x " : ""
+    pre + (isRes ? "R x" : "S x") + str.tostring(cnt)
+f_srDraw(i) =>
+    p     = array.get(srPrice, i)
+    isRes = array.get(srIsRes, i)
+    col   = isRes ? srColRes : srColSup
+    bBar  = array.get(srBirthBar, i)
+    if srUseZone
+        bx = box.new(bBar, p + srTol / 2, bar_index, p - srTol / 2, border_color = col, bgcolor = color.new(col, 82))
+        array.set(srBox, i, bx)
+    else
+        ln = line.new(bBar, p, bar_index, p, color = col, width = 2, style = line.style_solid)
+        array.set(srLine, i, ln)
+    if srShowCnt
+        lblStyle = isRes ? label.style_label_down : label.style_label_up
+        lb = label.new(bar_index, p, f_srLabelText(isRes, array.get(srCount, i), false), style = lblStyle, color = col, textcolor = color.white, size = size.tiny)
+        array.set(srLbl, i, lb)
+    true
+f_srBreak(i) =>
+    if brkMode == "Delete"
+        f_srRemove(i)
+    else
+        array.set(srBroken, i, true)
+        ln = array.get(srLine, i)
+        if not na(ln)
+            line.set_color(ln, brkColor)
+            line.set_style(ln, line.style_dashed)
+        bx = array.get(srBox, i)
+        if not na(bx)
+            box.set_border_color(bx, brkColor)
+            box.set_bgcolor(bx, color.new(brkColor, 88))
+        lb = array.get(srLbl, i)
+        if not na(lb)
+            isRes = array.get(srIsRes, i)
+            label.set_color(lb, brkColor)
+            label.set_text(lb, f_srLabelText(isRes, array.get(srCount, i), true))
+    true   // CE10235-safe: unified return so both branches yield bool
+// ============================ S/R ENGINE (confirmed bars) ===========
+var bool  retestBuySig     = false
+var bool  retestSellSig    = false
+var float retestSigLevel   = na
+retestBuySig    := false
+retestSellSig   := false
+if barstate.isconfirmed and srShow
+    c = close
+    // 1) expire old levels
+    if array.size(srPrice) > 0
+        for i = array.size(srPrice) - 1 to 0
+            if f_srExpired(i)
+                f_srRemove(i)
+    // 2) broken-level check
+    if array.size(srPrice) > 0
+        for i = array.size(srPrice) - 1 to 0
+            if array.get(srDrawn, i) and not array.get(srBroken, i)
+                lvl   = array.get(srPrice, i)
+                isRes = array.get(srIsRes, i)
+                brokeUp   = isRes and c > lvl + brkBuf
+                brokeDown = (not isRes) and c < lvl - brkBuf
+                if brokeUp or brokeDown
+                    f_srBreak(i)
+    // 2b) retest check on BROKEN, not-yet-retested levels (Gray Out only)
+    if brkMode == "Gray Out" and array.size(srPrice) > 0
+        for i = array.size(srPrice) - 1 to 0
+            if array.get(srBroken, i) and not array.get(srRetested, i)
+                lvl   = array.get(srPrice, i)
+                isRes = array.get(srIsRes, i)
+                retRes = isRes and low <= lvl + brkBuf and close >= lvl - brkBuf
+                retSup = (not isRes) and high >= lvl - brkBuf and close <= lvl + brkBuf
+                if retRes or retSup
+                    array.set(srRetested, i, true)
+                    array.set(srArmed, i, true)
+                    array.set(srArmBar, i, bar_index)
+    // 2c) retest-confirmation entry — armed level REJECTS in break dir
+    if useRetest and array.size(srPrice) > 0
+        for i = array.size(srPrice) - 1 to 0
+            if array.get(srArmed, i)
+                lvl    = array.get(srPrice, i)
+                isRes  = array.get(srIsRes, i)
+                armAge = bar_index - array.get(srArmBar, i)
+                if armAge > retestArmBars
+                    array.set(srArmed, i, false)
+                else
+                    canCheck = retestSepBar ? (armAge >= 1) : (armAge >= 0)
+                    if canCheck
+                        confBuy  = isRes and close > lvl + confBuf
+                        confSell = (not isRes) and close < lvl - confBuf
+                        if confBuy
+                            array.set(srArmed, i, false)
+                            retestBuySig  := true
+                            retestSigLevel:= lvl
+                        else if confSell
+                            array.set(srArmed, i, false)
+                            retestSellSig := true
+                            retestSigLevel:= lvl
+    // 3) match this close to an existing cluster (skip broken ones)
+    matched = false
+    if array.size(srPrice) > 0
+        for i = 0 to array.size(srPrice) - 1
+            if not array.get(srBroken, i) and math.abs(c - array.get(srPrice, i)) <= srTol
+                nc = array.get(srCount, i) + 1
+                np = (array.get(srPrice, i) * array.get(srCount, i) + c) / nc
+                array.set(srCount, i, nc)
+                array.set(srPrice, i, np)
+                matched := true
+                alreadyDrawn = array.get(srDrawn, i)
+                if nc == srMinTouch and not alreadyDrawn
+                    array.set(srDrawn, i, true)
+                    array.set(srIsRes, i, np >= srRef)
+                    f_srDraw(i)
+                else if nc > srMinTouch and alreadyDrawn and srShowCnt
+                    lb = array.get(srLbl, i)
+                    if not na(lb)
+                        isRes = array.get(srIsRes, i)
+                        label.set_text(lb, f_srLabelText(isRes, nc, false))
+                        label.set_xy(lb, bar_index, np)
+                break
+    // 4) no match -> new candidate cluster
+    if not matched
+        array.push(srPrice, c)
+        array.push(srCount, 1)
+        array.push(srBirthMs, time)
+        array.push(srBirthSes, sessCount)
+        array.push(srBirthBar, bar_index)
+        array.push(srIsRes, false)
+        array.push(srDrawn, false)
+        array.push(srBroken, false)
+        array.push(srRetested, false)
+        array.push(srArmed, false)
+        array.push(srArmBar, 0)
+        array.push(srLine, na)
+        array.push(srBox, na)
+        array.push(srLbl, na)
+        if array.size(srPrice) > 60
+            f_srRemove(0)
+// 5) extend active (drawn, not broken) levels to current bar
+if srShow and array.size(srPrice) > 0
+    for i = 0 to array.size(srPrice) - 1
+        if array.get(srDrawn, i) and not array.get(srBroken, i)
+            ln = array.get(srLine, i)
+            if not na(ln)
+                line.set_x2(ln, bar_index)
+            bx = array.get(srBox, i)
+            if not na(bx)
+                box.set_right(bx, bar_index)
+// =====================================================================
+//  ICC PULLBACK ENGINE  (Indication -> Correction -> Continuation)
+//  Phase: 0 = none, 1 = indication, 2 = correction
+// =====================================================================
+var int   iccPhase   = 0
+var int   iccDir     = 0
+var float indLevel   = na
+var float indExtreme = na
+var float corrExtreme= na
+var int   iccStartBar= 0
+var bool  iccBuySig  = false
+var bool  iccSellSig = false
+var float iccSigSL   = na
+iccBuySig  := false
+iccSellSig := false
+iccSigSL   := na
+dataReady = not na(m15c1) and not na(wkH1c) and not na(wkL1c)
+if useICC and barstate.isconfirmed and dataReady
+    // Bias flip cancels an in-progress setup facing the wrong way
+    if iccPhase != 0 and iccDir != 0 and htf != 0 and htf != iccDir
+        iccPhase := 0
+        iccDir := 0
+    // Expiry: setup must complete inside the window
+    if iccPhase != 0 and (bar_index - iccStartBar) > iccExpiry
+        iccPhase := 0
+        iccDir := 0
+    //================= BULLISH branch =================
+    if htf == 1
+        if iccPhase == 0
+            if not na(wkLastHi) and m15c1 > wkLastHi
+                iccPhase   := 1
+                iccDir     := 1
+                indLevel   := wkLastHi
+                indExtreme := math.max(wkH1c, m15c1)
+                corrExtreme:= wkL1c
+                iccStartBar:= bar_index
+        else if iccPhase == 1 and iccDir == 1
+            indExtreme := math.max(indExtreme, wkH1c)
+            leg = indExtreme - indLevel
+            if leg > 0
+                disc  = indExtreme - leg * corrRetMin
+                inval = indExtreme - leg * corrRetMax
+                if wkL1c <= inval
+                    iccPhase := 0
+                    iccDir := 0
+                else if wkL1c <= disc
+                    iccPhase    := 2
+                    corrExtreme := wkL1c
+        else if iccPhase == 2 and iccDir == 1
+            corrExtreme := math.min(corrExtreme, wkL1c)
+            leg   = indExtreme - indLevel
+            inval = leg > 0 ? indExtreme - leg * corrRetMax : 0.0
+            if leg > 0 and wkL1c <= inval
+                iccPhase := 0
+                iccDir := 0
+            else if not na(m15h2) and m15c1 > m15h2
+                iccBuySig := true
+                iccSigSL  := corrExtreme - iccSLbuf
+                iccPhase := 0
+                iccDir := 0
+    //================= BEARISH branch =================
+    else if htf == -1
+        if iccPhase == 0
+            if not na(wkLastLo) and m15c1 < wkLastLo
+                iccPhase   := 1
+                iccDir     := -1
+                indLevel   := wkLastLo
+                indExtreme := math.min(wkL1c, m15c1)
+                corrExtreme:= wkH1c
+                iccStartBar:= bar_index
+        else if iccPhase == 1 and iccDir == -1
+            indExtreme := math.min(indExtreme, wkL1c)
+            leg = indLevel - indExtreme
+            if leg > 0
+                prem  = indExtreme + leg * corrRetMin
+                inval = indExtreme + leg * corrRetMax
+                if wkH1c >= inval
+                    iccPhase := 0
+                    iccDir := 0
+                else if wkH1c >= prem
+                    iccPhase    := 2
+                    corrExtreme := wkH1c
+        else if iccPhase == 2 and iccDir == -1
+            corrExtreme := math.max(corrExtreme, wkH1c)
+            leg   = indLevel - indExtreme
+            inval = leg > 0 ? indExtreme + leg * corrRetMax : 0.0
+            if leg > 0 and wkH1c >= inval
+                iccPhase := 0
+                iccDir := 0
+            else if not na(m15l2) and m15c1 < m15l2
+                iccSellSig := true
+                iccSigSL   := corrExtreme + iccSLbuf
+                iccPhase := 0
+                iccDir := 0
+    // htf flat: no new setup; guards above handle any in-progress reset.
+// ============================ CASCADE BREAKOUT (v1, optional) ========
+buyContinuation  = useCascade and alignBull and not na(wkLastHi) and m15c1 > wkLastHi
+sellContinuation = useCascade and alignBear and not na(wkLastLo) and m15c1 < wkLastLo
+cascBuySig  = buyContinuation  and not buyContinuation[1]
+cascSellSig = sellContinuation and not sellContinuation[1]
+// ============================ COMBINED SIGNALS ======================
+buySig  = iccBuySig  or retestBuySig  or cascBuySig
+sellSig = iccSellSig or retestSellSig or cascSellSig
+// =====================================================================
+//  v2.2 STRUCTURAL TAKE-PROFIT (Sci: "target the previous high")
+//  f_structTP: nearest un-broken S/R level beyond entry in trade dir
+//  (long -> lowest resistance above; short -> highest support below),
+//  falling back to the prior working-TF swing extreme. f_tp: returns
+//  [tpPrice, usedStruct]; structural target must clear a mintick floor
+//  and the tpMinRR reward floor, else fixed-RR (entry +/- stop*RR).
+// =====================================================================
+tpHiFallback = request.security(syminfo.tickerid, workTF, ta.highest(high, tpLookback), lookahead = barmerge.lookahead_off)
+tpLoFallback = request.security(syminfo.tickerid, workTF, ta.lowest(low,  tpLookback), lookahead = barmerge.lookahead_off)
+var float g_lastTP       = na
+var bool  g_lastTPstruct = false
+f_structTP(int dir, float entryPx) =>
+    best = 0.0
+    if array.size(srPrice) > 0
+        for i = 0 to array.size(srPrice) - 1
+            if array.get(srDrawn, i) and not array.get(srBroken, i)
+                lvl = array.get(srPrice, i)
+                if dir > 0 and lvl > entryPx
+                    best := (best == 0.0 or lvl < best) ? lvl : best
+                if dir < 0 and lvl < entryPx
+                    best := (best == 0.0 or lvl > best) ? lvl : best
+    if best == 0.0
+        if dir > 0
+            best := (not na(tpHiFallback) and tpHiFallback > entryPx) ? tpHiFallback : 0.0
+        else
+            best := (not na(tpLoFallback) and tpLoFallback > 0.0 and tpLoFallback < entryPx) ? tpLoFallback : 0.0
+    best
+f_tp(int dir, float entryPx, float d) =>
+    float tpx = dir > 0 ? entryPx + d * rrRatio : entryPx - d * rrRatio
+    bool  us  = false
+    if tpMode == "Structural"
+        lvl = f_structTP(dir, entryPx)
+        if lvl > 0.0
+            dist = dir > 0 ? (lvl - entryPx) : (entryPx - lvl)
+            if dist >= syminfo.mintick * 10 and dist >= d * tpMinRR
+                tpx := lvl
+                us  := true
+    [tpx, us]
+// =====================================================================
+//  SMART STOP + ORDER ROUTING
+// =====================================================================
+f_atrStop() =>
+    na(atrVal) ? slBufP : atrVal * atrMult
+f_longStopDist(anchor) =>
+    structDist = math.max(0.0, close - anchor) + slBufP
+    atrStop    = f_atrStop()
+    d = slMethod == "Structural" ? structDist : slMethod == "ATR" ? atrStop : math.max(structDist, atrStop)
+    math.max(d, syminfo.mintick * 10)
+f_shortStopDist(anchor) =>
+    structDist = math.max(0.0, anchor - close) + slBufP
+    atrStop    = f_atrStop()
+    d = slMethod == "Structural" ? structDist : slMethod == "ATR" ? atrStop : math.max(structDist, atrStop)
+    math.max(d, syminfo.mintick * 10)
+flat    = strategy.position_size == 0
+isLong  = strategy.position_size > 0
+isShort = strategy.position_size < 0
+// close on opposite signal
+if closeOnOpp and isLong and sellSig
+    strategy.close("Long", comment = "EXIT LONG")
+if closeOnOpp and isShort and buySig
+    strategy.close("Short", comment = "EXIT SHORT")
+canEnter = flat and inSession and barstate.isconfirmed
+var float entrySL = na
+var float entryTP = na
+if canEnter
+    // ICC pullback takes priority, then retest, then cascade breakout
+    if iccBuySig
+        anchor = not na(iccSigSL) ? iccSigSL : wkLastLo
+        d  = f_longStopDist(anchor)
+        sl = close - d
+        [tp, tpUS] = f_tp(1, close, d)
+        strategy.entry("Long", strategy.long, comment = "ICC BUY")
+        entrySL := sl
+        entryTP := tp
+        g_lastTP := tp
+        g_lastTPstruct := tpUS
+    else if iccSellSig
+        anchor = not na(iccSigSL) ? iccSigSL : wkLastHi
+        d  = f_shortStopDist(anchor)
+        sl = close + d
+        [tp, tpUS] = f_tp(-1, close, d)
+        strategy.entry("Short", strategy.short, comment = "ICC SELL")
+        entrySL := sl
+        entryTP := tp
+        g_lastTP := tp
+        g_lastTPstruct := tpUS
+    else if retestBuySig
+        anchor = retestSigLevel - slBuf
+        d  = f_longStopDist(anchor)
+        sl = close - d
+        [tp, tpUS] = f_tp(1, close, d)
+        strategy.entry("Long", strategy.long, comment = "RETEST BUY")
+        entrySL := sl
+        entryTP := tp
+        g_lastTP := tp
+        g_lastTPstruct := tpUS
+    else if retestSellSig
+        anchor = retestSigLevel + slBuf
+        d  = f_shortStopDist(anchor)
+        sl = close + d
+        [tp, tpUS] = f_tp(-1, close, d)
+        strategy.entry("Short", strategy.short, comment = "RETEST SELL")
+        entrySL := sl
+        entryTP := tp
+        g_lastTP := tp
+        g_lastTPstruct := tpUS
+    else if cascBuySig
+        d  = f_longStopDist(wkLastLo)
+        sl = close - d
+        [tp, tpUS] = f_tp(1, close, d)
+        strategy.entry("Long", strategy.long, comment = "BUY BREAKOUT")
+        entrySL := sl
+        entryTP := tp
+        g_lastTP := tp
+        g_lastTPstruct := tpUS
+    else if cascSellSig
+        d  = f_shortStopDist(wkLastHi)
+        sl = close + d
+        [tp, tpUS] = f_tp(-1, close, d)
+        strategy.entry("Short", strategy.short, comment = "SELL BREAKOUT")
+        entrySL := sl
+        entryTP := tp
+        g_lastTP := tp
+        g_lastTPstruct := tpUS
+// =====================================================================
+//  EXITS: fixed SL/TP + optional break-even + trailing
+// =====================================================================
+if isLong and not na(entrySL)
+    curSL = entrySL
+    if useBE and (high - strategy.position_avg_price) >= beAt
+        curSL := math.max(curSL, strategy.position_avg_price + beLock)
+    strategy.exit("XL", "Long", stop = curSL, limit = entryTP,
+         trail_price  = useTrail ? strategy.position_avg_price + trailStart : na,
+         trail_offset = useTrail ? trailStepPips * (pip / syminfo.mintick) : na)
+if isShort and not na(entrySL)
+    curSL = entrySL
+    if useBE and (strategy.position_avg_price - low) >= beAt
+        curSL := math.min(curSL, strategy.position_avg_price - beLock)
+    strategy.exit("XS", "Short", stop = curSL, limit = entryTP,
+         trail_price  = useTrail ? strategy.position_avg_price - trailStart : na,
+         trail_offset = useTrail ? trailStepPips * (pip / syminfo.mintick) : na)
+// =====================================================================
+//  ENTRY MARKERS + ICC PHASE LABELS + ALERTS
+// =====================================================================
+plotshape(iccBuySig,    title="ICC BUY",   style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime,0),   size = size.small, text = "ICC^")
+plotshape(iccSellSig,   title="ICC SELL",  style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),   size = size.small, text = "ICCv")
+plotshape(retestBuySig, title="RETEST BUY",  style = shape.labelup,   location = location.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.tiny, text = "RT^")
+plotshape(retestSellSig,title="RETEST SELL", style = shape.labeldown, location = location.abovebar, color = color.new(color.maroon,0), textcolor = color.white, size = size.tiny, text = "RTv")
+plotshape(cascBuySig,   title="BREAKOUT BUY",  style = shape.diamond, location = location.belowbar, color = color.new(color.aqua,0),   size = size.tiny, text = "BO^")
+plotshape(cascSellSig,  title="BREAKOUT SELL", style = shape.diamond, location = location.abovebar, color = color.new(color.fuchsia,0),size = size.tiny, text = "BOv")
+// ICC phase transition markers (diagnostics)
+indFired = iccPhase == 1 and iccPhase[1] != 1
+corFired = iccPhase == 2 and iccPhase[1] != 2
+if showICClabels and indFired
+    label.new(bar_index, low, "IND " + (iccDir == 1 ? "▲" : "▼"), style = label.style_label_up, color = color.new(color.blue, 30), textcolor = color.white, size = size.tiny)
+if showICClabels and corFired
+    label.new(bar_index, high, "COR", style = label.style_label_down, color = color.new(color.orange, 30), textcolor = color.white, size = size.tiny)
+alertcondition(iccBuySig,    "ICC BUY (continuation)",  '{"symbol":"{{ticker}}","tf":"{{interval}}","side":"BUY","type":"icc","price":{{close}},"strategy":"ICC-Sci-Strat-v2.2"}')
+alertcondition(iccSellSig,   "ICC SELL (continuation)", '{"symbol":"{{ticker}}","tf":"{{interval}}","side":"SELL","type":"icc","price":{{close}},"strategy":"ICC-Sci-Strat-v2.2"}')
+alertcondition(retestBuySig, "ICC RETEST BUY",  '{"symbol":"{{ticker}}","tf":"{{interval}}","side":"BUY","type":"retest","price":{{close}},"strategy":"ICC-Sci-Strat-v2.2"}')
+alertcondition(retestSellSig,"ICC RETEST SELL", '{"symbol":"{{ticker}}","tf":"{{interval}}","side":"SELL","type":"retest","price":{{close}},"strategy":"ICC-Sci-Strat-v2.2"}')
+// =====================================================================
+//  CASCADE + ICC DASHBOARD
+// =====================================================================
+var table dash = table.new(position.top_right, 2, 11, border_width = 1)
+f_biasTxt(b) =>
+    b == 1 ? "^ BULL" : b == -1 ? "v BEAR" : "- flat"
+f_biasCol(b) =>
+    bullCol = color.new(color.green, 70)
+    bearCol = color.new(color.red,   70)
+    flatCol = color.new(color.gray,  70)
+    b == 1 ? bullCol : b == -1 ? bearCol : flatCol
+f_phaseTxt(p) =>
+    p == 1 ? "IND" : p == 2 ? "COR" : "---"
+f_srActive() =>
+    cnt = 0
+    if array.size(srDrawn) > 0
+        for i = 0 to array.size(srDrawn) - 1
+            if array.get(srDrawn, i) and not array.get(srBroken, i)
+                cnt += 1
+    cnt
+f_srArmed() =>
+    cnt = 0
+    if array.size(srArmed) > 0
+        for i = 0 to array.size(srArmed) - 1
+            if array.get(srArmed, i)
+                cnt += 1
+    cnt
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "TF",   bgcolor=color.new(color.black,70), text_color=color.white)
+    table.cell(dash, 1, 0, "Bias", bgcolor=color.new(color.black,70), text_color=color.white)
+    table.cell(dash, 0, 1, biasTF, text_color=color.white)
+    table.cell(dash, 1, 1, f_biasTxt(biasD1),  bgcolor=f_biasCol(biasD1))
+    table.cell(dash, 0, 2, midTF,  text_color=color.white)
+    table.cell(dash, 1, 2, f_biasTxt(biasH4),  bgcolor=f_biasCol(biasH4))
+    table.cell(dash, 0, 3, workTF, text_color=color.white)
+    table.cell(dash, 1, 3, f_biasTxt(biasH1),  bgcolor=f_biasCol(biasH1))
+    table.cell(dash, 0, 4, trigTF, text_color=color.white)
+    table.cell(dash, 1, 4, f_biasTxt(biasM15), bgcolor=f_biasCol(biasM15))
+    table.cell(dash, 0, 5, "HTF filter", text_color=color.white)
+    table.cell(dash, 1, 5, f_biasTxt(htf), bgcolor=f_biasCol(htf))
+    table.cell(dash, 0, 6, "HTF score", text_color=color.white)
+    table.cell(dash, 1, 6, str.tostring(htfScore, "#.##") + " (min " + str.tostring(htfMinConv, "#.##") + ")", text_color=color.white)
+    table.cell(dash, 0, 7, "ICC phase", text_color=color.white)
+    iccBg = iccPhase == 2 ? color.new(color.orange,40) : iccPhase == 1 ? color.new(color.blue,40) : color.new(color.gray,60)
+    table.cell(dash, 1, 7, f_phaseTxt(iccPhase) + " (" + str.tostring(iccDir) + ")", bgcolor=iccBg, text_color=color.white)
+    alignedTxt = alignBull ? "^ ALIGNED LONG" : alignBear ? "v ALIGNED SHORT" : "x NOT ALIGNED"
+    alignedBg  = alignBull ? color.new(color.green,40) : alignBear ? color.new(color.red, 40) : color.new(color.gray, 40)
+    table.cell(dash, 0, 8, "Cascade", text_color=color.white)
+    table.cell(dash, 1, 8, alignedTxt, bgcolor=alignedBg, text_color=color.white)
+    table.cell(dash, 0, 9, "S/R (armed)", text_color=color.white)
+    table.cell(dash, 1, 9, str.tostring(f_srActive()) + " (" + str.tostring(f_srArmed()) + ")", text_color=color.white)
+    table.cell(dash, 0, 10, "TP mode", text_color=color.white)
+    tpTxt = (tpMode == "Structural") ? "STRUCT" : "FIXED_RR"
+    tpTxt := na(g_lastTP) ? tpTxt : tpTxt + " " + str.tostring(g_lastTP) + (g_lastTPstruct ? " [s]" : " [rr]")
+    tpBg  = (tpMode == "Structural") ? color.new(color.teal,40) : color.new(color.gray,60)
+    table.cell(dash, 1, 10, tpTxt, bgcolor=tpBg, text_color=color.white)

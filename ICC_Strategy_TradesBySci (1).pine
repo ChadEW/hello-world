@@ -1,0 +1,174 @@
+//@version=5
+strategy("ICC Strategy – Trades by Sci", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=2, initial_capital=10000)
+
+// ═══════════════════════════════════════════════════════════════
+//  ICC STRATEGY — Indication → Correction → Continuation
+//  Based on the trading method by Trades by Sci
+//  Includes: Stop-Loss, Take-Profit, and Alert Conditions
+// ═══════════════════════════════════════════════════════════════
+
+// ──────────────── INPUTS ────────────────
+swingLen        = input.int(5,     "Swing Lookback Length",       minval=2,  group="Structure")
+corrPct         = input.float(20,  "Min Correction Retrace %",   minval=5,  maxval=80, step=5, group="Structure")
+rrRatio         = input.float(2.0, "Risk : Reward Ratio (TP)",   minval=0.5, maxval=10, step=0.5, group="Risk Management")
+slBuffer        = input.float(0.5, "SL Buffer (× ATR)",          minval=0,  maxval=3,  step=0.1, group="Risk Management")
+atrLen          = input.int(14,    "ATR Length",                  minval=1,  group="Risk Management")
+useTrailSL      = input.bool(false,"Use Trailing Stop",          group="Risk Management")
+trailPct        = input.float(1.0, "Trailing Stop %",            minval=0.1, maxval=10, step=0.1, group="Risk Management")
+showLabels      = input.bool(true, "Show ICC Phase Labels",      group="Display")
+showSLTP        = input.bool(true, "Show SL / TP Lines",         group="Display")
+
+// ──────────────── ATR ────────────────
+atr = ta.atr(atrLen)
+
+// ──────────────── SWING DETECTION ────────────────
+swingHigh = ta.pivothigh(high, swingLen, swingLen)
+swingLow  = ta.pivotlow(low,  swingLen, swingLen)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if not na(swingHigh)
+    lastSwingHigh := swingHigh
+if not na(swingLow)
+    lastSwingLow := swingLow
+
+// ──────────────── STATE MACHINE ────────────────
+// States: 0 = Idle, 1 = Indication detected, 2 = Correction detected
+var int   stateBull = 0
+var int   stateBear = 0
+
+// Bullish ICC variables
+var float bullIndHigh   = na   // Indication candle high
+var float bullIndLow    = na   // Indication candle low
+var float bullIndClose  = na   // Indication candle close
+var float bullCorrLow   = na   // Correction swing low
+var int   bullCorrBars  = 0
+
+// Bearish ICC variables
+var float bearIndHigh   = na
+var float bearIndLow    = na
+var float bearIndClose  = na
+var float bearCorrHigh  = na
+var int   bearCorrBars  = 0
+
+// ──────────────── BULLISH ICC DETECTION ────────────────
+// INDICATION: Candle body closes above the last swing high
+bullIndication = not na(lastSwingHigh) and close > lastSwingHigh and close > open and (close - open) > atr * 0.3
+
+if bullIndication and stateBull == 0
+    stateBull    := 1
+    bullIndHigh  := high
+    bullIndLow   := low
+    bullIndClose := close
+    bullCorrLow  := low
+    bullCorrBars := 0
+
+// CORRECTION: Price retraces down at least corrPct% of the indication move
+bullCorrRange   = bullIndClose - bullIndLow
+bullCorrTarget  = bullIndClose - (bullCorrRange * corrPct / 100)
+
+if stateBull == 1
+    bullCorrBars += 1
+    if low < bullCorrLow
+        bullCorrLow := low
+    // Correction confirmed: price pulled back enough & at least 2 bars elapsed
+    if bullCorrLow <= bullCorrTarget and bullCorrBars >= 2
+        stateBull := 2
+    // Invalidation: correction retraces past indication origin
+    if bullCorrLow < bullIndLow
+        stateBull   := 0
+        bullCorrLow := na
+
+// CONTINUATION: Candle body closes above the indication high
+bullContinuation = stateBull == 2 and close > bullIndHigh and close > open
+
+// ──────────────── BEARISH ICC DETECTION ────────────────
+// INDICATION: Candle body closes below the last swing low
+bearIndication = not na(lastSwingLow) and close < lastSwingLow and close < open and (open - close) > atr * 0.3
+
+if bearIndication and stateBear == 0
+    stateBear    := 1
+    bearIndHigh  := high
+    bearIndLow   := low
+    bearIndClose := close
+    bearCorrHigh := high
+    bearCorrBars := 0
+
+// CORRECTION: Price retraces up at least corrPct% of the indication move
+bearCorrRange   = bearIndHigh - bearIndClose
+bearCorrTarget  = bearIndClose + (bearCorrRange * corrPct / 100)
+
+if stateBear == 1
+    bearCorrBars += 1
+    if high > bearCorrHigh
+        bearCorrHigh := high
+    if bearCorrHigh >= bearCorrTarget and bearCorrBars >= 2
+        stateBear := 2
+    // Invalidation: correction retraces past indication origin
+    if bearCorrHigh > bearIndHigh
+        stateBear    := 0
+        bearCorrHigh := na
+
+// CONTINUATION: Candle body closes below the indication low
+bearContinuation = stateBear == 2 and close < bearIndLow and close < open
+
+// ──────────────── STOP-LOSS & TAKE-PROFIT CALCULATIONS ────────────────
+var float longSL  = na
+var float longTP  = na
+var float shortSL = na
+var float shortTP = na
+
+if bullContinuation
+    longSL  := bullCorrLow - (atr * slBuffer)    // SL below correction low + buffer
+    riskAmt  = close - longSL
+    longTP  := close + (riskAmt * rrRatio)         // TP based on R:R
+
+if bearContinuation
+    shortSL := bearCorrHigh + (atr * slBuffer)    // SL above correction high + buffer
+    riskAmt  = shortSL - close
+    shortTP := close - (riskAmt * rrRatio)         // TP based on R:R
+
+// ──────────────── STRATEGY ENTRIES & EXITS ────────────────
+if bullContinuation and strategy.position_size <= 0
+    strategy.entry("ICC Long", strategy.long)
+    strategy.exit("Long Exit", "ICC Long", stop=longSL, limit=longTP, trail_points=useTrailSL ? close * trailPct / 100 / syminfo.mintick : na, trail_offset=useTrailSL ? close * trailPct / 100 / syminfo.mintick : na)
+    stateBull := 0   // Reset cycle
+
+if bearContinuation and strategy.position_size >= 0
+    strategy.entry("ICC Short", strategy.short)
+    strategy.exit("Short Exit", "ICC Short", stop=shortSL, limit=shortTP, trail_points=useTrailSL ? close * trailPct / 100 / syminfo.mintick : na, trail_offset=useTrailSL ? close * trailPct / 100 / syminfo.mintick : na)
+    stateBear := 0   // Reset cycle
+
+// ──────────────── VISUAL LABELS ────────────────
+if showLabels and bullIndication and stateBull == 1
+    label.new(bar_index, low, "I", style=label.style_label_up, color=color.new(color.blue, 20), textcolor=color.white, size=size.small)
+
+if showLabels and stateBull == 2 and stateBull[1] == 1
+    label.new(bar_index, low, "C", style=label.style_label_up, color=color.new(color.orange, 20), textcolor=color.white, size=size.small)
+
+if showLabels and bullContinuation
+    label.new(bar_index, low, "C✓", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+
+if showLabels and bearIndication and stateBear == 1
+    label.new(bar_index, high, "I", style=label.style_label_down, color=color.new(color.blue, 20), textcolor=color.white, size=size.small)
+
+if showLabels and stateBear == 2 and stateBear[1] == 1
+    label.new(bar_index, high, "C", style=label.style_label_down, color=color.new(color.orange, 20), textcolor=color.white, size=size.small)
+
+if showLabels and bearContinuation
+    label.new(bar_index, high, "C✓", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+
+// ──────────────── SL / TP PLOT LINES ────────────────
+plot(showSLTP and strategy.position_size > 0 ? longSL  : na, "Long SL",  color=color.red,   style=plot.style_linebr, linewidth=2)
+plot(showSLTP and strategy.position_size > 0 ? longTP  : na, "Long TP",  color=color.green,  style=plot.style_linebr, linewidth=2)
+plot(showSLTP and strategy.position_size < 0 ? shortSL : na, "Short SL", color=color.red,    style=plot.style_linebr, linewidth=2)
+plot(showSLTP and strategy.position_size < 0 ? shortTP : na, "Short TP", color=color.green,   style=plot.style_linebr, linewidth=2)
+
+// ──────────────── BACKGROUND HIGHLIGHT ────────────────
+bgcolor(bullContinuation ? color.new(color.green, 90) : na, title="Long Signal BG")
+bgcolor(bearContinuation ? color.new(color.red, 90)   : na, title="Short Signal BG")
+
+// ──────────────── ALERTS ────────────────
+alertcondition(bullContinuation, title="ICC Long Entry",  message="ICC LONG: Bullish continuation confirmed. Enter long.")
+alertcondition(bearContinuation, title="ICC Short Entry", message="ICC SHORT: Bearish continuation confirmed. Enter short.")

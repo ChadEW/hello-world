@@ -1,0 +1,306 @@
+//@version=5
+strategy("ICC Strategy — Trades By Sci", overlay=true,
+     default_qty_type  = strategy.percent_of_equity, 
+     default_qty_value = 2,
+     initial_capital   = 10000, 
+     pyramiding        = 0)
+
+// ══════════════════════════════════════════════════════════════
+//  ICC — Indication, Correction, Continuation
+//  Based on the trading methodology of Trades By Sci
+//
+//  LOGIC:
+//    Bullish:  HH (Indication) → HL (Correction) → HH (Continuation = BUY)
+//    Bearish:  LL (Indication) → LH (Correction) → LL (Continuation = SELL)
+//    Exit:     Market structure break (LL while long, HH while short)
+// ══════════════════════════════════════════════════════════════
+
+
+// ┌────────────────────────────────────────────────────────────┐
+// │                        INPUTS                              │
+// └────────────────────────────────────────────────────────────┘
+
+string GRP1 = "══ Swing Detection ══"
+int pivotLen = input.int(5, "Pivot Lookback Length", minval=2, maxval=50, group=GRP1,
+     tooltip="Bars on each side to confirm a swing point.\nHigher = fewer, more significant swings.\nRecommended: 3–10 depending on timeframe.")
+
+string GRP2 = "══ Risk Management ══"
+string slMode  = input.string("Structure", "Stop Loss Mode", 
+     options=["Structure", "ATR", "Tighter of Both"], group=GRP2,
+     tooltip="Structure = below last swing low (long) / above last swing high (short).\nATR = dynamic volatility-based.\nTighter of Both = whichever is closer to entry.")
+int    atrLen  = input.int(14, "ATR Length", group=GRP2)
+float  atrMult = input.float(1.5, "ATR Multiplier (SL)", step=0.1, minval=0.5, group=GRP2)
+float  rrRatio = input.float(2.0, "Reward : Risk Ratio (TP)", step=0.1, minval=0.5, group=GRP2)
+bool   useTrail  = input.bool(false, "Enable Trailing Stop (ATR-based)", group=GRP2)
+float  trailMult = input.float(2.0, "Trail ATR Multiplier", step=0.1, group=GRP2)
+
+string GRP3 = "══ HTF Trend Filter ══"
+bool   useHTF    = input.bool(false, "Enable Higher-Timeframe Filter", group=GRP3,
+     tooltip="Longs only when price > HTF EMA.\nShorts only when price < HTF EMA.\nKeeps you aligned with the bigger picture.")
+string htfTF     = input.timeframe("60", "Timeframe", group=GRP3)
+int    htfEmaLen = input.int(50, "EMA Length", group=GRP3)
+
+string GRP4 = "══ Display ══"
+bool showSwings = input.bool(true, "Show Swing Labels (HH/HL/LH/LL)", group=GRP4)
+bool showBG     = input.bool(true, "Show Trend Background Shading", group=GRP4)
+bool showDash   = input.bool(true, "Show Dashboard Panel", group=GRP4)
+
+
+// ┌────────────────────────────────────────────────────────────┐
+// │                  SWING POINT DETECTION                     │
+// └────────────────────────────────────────────────────────────┘
+
+float ph = ta.pivothigh(high, pivotLen, pivotLen)
+float pl = ta.pivotlow(low,  pivotLen, pivotLen)
+
+// Track current and previous swing highs / lows
+var float currSH = na,  var float prevSH = na
+var float currSL = na,  var float prevSL = na
+var int   shBar  = 0,   var int   slBar  = 0
+
+if not na(ph)
+    prevSH := currSH
+    currSH := ph
+    shBar  := bar_index - pivotLen
+
+if not na(pl)
+    prevSL := currSL
+    currSL := pl
+    slBar  := bar_index - pivotLen
+
+
+// ┌────────────────────────────────────────────────────────────┐
+// │              MARKET STRUCTURE CLASSIFICATION                │
+// └────────────────────────────────────────────────────────────┘
+// HH / LH are mutually exclusive (new swing high detected)
+// HL / LL are mutually exclusive (new swing low detected)
+
+bool isHH = not na(ph) and not na(prevSH) and currSH >  prevSH   // Higher High
+bool isLH = not na(ph) and not na(prevSH) and currSH <= prevSH   // Lower High (or equal)
+bool isHL = not na(pl) and not na(prevSL) and currSL >= prevSL   // Higher Low (or equal)
+bool isLL = not na(pl) and not na(prevSL) and currSL <  prevSL   // Lower Low
+
+
+// ┌────────────────────────────────────────────────────────────┐
+// │                   HTF TREND FILTER                         │
+// └────────────────────────────────────────────────────────────┘
+
+float htfEma = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfEmaLen))
+bool  okLong  = useHTF ? (close > htfEma) : true
+bool  okShort = useHTF ? (close < htfEma) : true
+
+
+// ┌────────────────────────────────────────────────────────────┐
+// │                    ICC STATE MACHINE                        │
+// │                                                            │
+// │   STATE 0 → Neutral         (scanning for Indication)      │
+// │   STATE 1 → Bull Indication (HH seen → waiting for HL)     │
+// │   STATE 2 → Bull Correction (HL seen → waiting for HH)     │
+// │   STATE 3 → Bear Indication (LL seen → waiting for LH)     │
+// │   STATE 4 → Bear Correction (LH seen → waiting for LL)     │
+// │                                                            │
+// │   Bullish flow:  0 → 1 → 2 → BUY (loop back to 1)        │
+// │   Bearish flow:  0 → 3 → 4 → SELL (loop back to 3)        │
+// │   Structure break flips the bias                           │
+// └────────────────────────────────────────────────────────────┘
+
+var int iccState = 0
+
+bool sigBuy   = false
+bool sigSell  = false
+bool sigExitL = false
+bool sigExitS = false
+
+if iccState == 0
+    // ── Neutral: look for the first Indication ──
+    if isHH
+        iccState := 1
+    else if isLL
+        iccState := 3
+
+else if iccState == 1
+    // ── Bullish Indication: waiting for HL (Correction) ──
+    if isLL                      // Structure break → bearish flip
+        iccState := 3
+        sigExitL := true
+    else if isHL
+        iccState := 2            // Correction confirmed ✓
+
+else if iccState == 2
+    // ── Bullish Correction: waiting for HH (Continuation) ──
+    if isLL                      // Structure break → bearish flip
+        iccState := 3
+        sigExitL := true
+    else if isHH
+        sigBuy   := true         // ✅ ICC CONTINUATION → BUY SIGNAL
+        iccState := 1            // This HH is the new Indication
+
+else if iccState == 3
+    // ── Bearish Indication: waiting for LH (Correction) ──
+    if isHH                      // Structure break → bullish flip
+        iccState := 1
+        sigExitS := true
+    else if isLH
+        iccState := 4            // Correction confirmed ✓
+
+else if iccState == 4
+    // ── Bearish Correction: waiting for LL (Continuation) ──
+    if isHH                      // Structure break → bullish flip
+        iccState := 1
+        sigExitS := true
+    else if isLL
+        sigSell  := true         // ✅ ICC CONTINUATION → SELL SIGNAL
+        iccState := 3            // This LL is the new Indication
+
+
+// ┌────────────────────────────────────────────────────────────┐
+// │                  STOP LOSS CALCULATION                      │
+// └────────────────────────────────────────────────────────────┘
+
+float atrVal = ta.atr(atrLen)
+
+calcSL(bool isLong) =>
+    float structLevel = isLong ? currSL : currSH
+    float atrLevel    = isLong ? (close - atrVal * atrMult) : (close + atrVal * atrMult)
+    float result = switch slMode
+        "Structure"       => na(structLevel) ? atrLevel : structLevel
+        "ATR"             => atrLevel
+        "Tighter of Both" => isLong ? math.max(nz(structLevel, atrLevel), atrLevel) : 
+                                       math.min(nz(structLevel, atrLevel), atrLevel)
+        => atrLevel
+    result
+
+
+// ┌────────────────────────────────────────────────────────────┐
+// │               STRATEGY EXECUTION & ALERTS                  │
+// └────────────────────────────────────────────────────────────┘
+
+// ── BUY Entry ──
+if sigBuy and okLong
+    float sl   = calcSL(true)
+    float risk = math.max(close - sl, syminfo.mintick)
+    float tp   = close + risk * rrRatio
+    strategy.entry("ICC Long", strategy.long)
+    if useTrail
+        strategy.exit("Long TP/SL", "ICC Long", stop=sl, limit=tp, 
+             trail_points  = math.round(atrVal * trailMult / syminfo.mintick),
+             trail_offset  = math.round(atrVal * trailMult / syminfo.mintick))
+    else
+        strategy.exit("Long TP/SL", "ICC Long", stop=sl, limit=tp)
+    alert("🟢 ICC BUY | " + syminfo.ticker + 
+         " | Entry: " + str.tostring(close, format.mintick) + 
+         " | SL: "    + str.tostring(sl, format.mintick) + 
+         " | TP: "    + str.tostring(tp, format.mintick), alert.freq_once_per_bar)
+
+// ── SELL Entry ──
+if sigSell and okShort
+    float sl   = calcSL(false)
+    float risk = math.max(sl - close, syminfo.mintick)
+    float tp   = close - risk * rrRatio
+    strategy.entry("ICC Short", strategy.short)
+    if useTrail
+        strategy.exit("Short TP/SL", "ICC Short", stop=sl, limit=tp,
+             trail_points  = math.round(atrVal * trailMult / syminfo.mintick),
+             trail_offset  = math.round(atrVal * trailMult / syminfo.mintick))
+    else
+        strategy.exit("Short TP/SL", "ICC Short", stop=sl, limit=tp)
+    alert("🔴 ICC SELL | " + syminfo.ticker + 
+         " | Entry: " + str.tostring(close, format.mintick) + 
+         " | SL: "    + str.tostring(sl, format.mintick) + 
+         " | TP: "    + str.tostring(tp, format.mintick), alert.freq_once_per_bar)
+
+// ── Structure-Break Exits ──
+if sigExitL and strategy.position_size > 0
+    strategy.close("ICC Long", comment="Structure Break ↓")
+    alert("⚠️ EXIT LONG | " + syminfo.ticker + 
+         " | Structure break — LL detected at " + str.tostring(close, format.mintick), 
+         alert.freq_once_per_bar)
+
+if sigExitS and strategy.position_size < 0
+    strategy.close("ICC Short", comment="Structure Break ↑")
+    alert("⚠️ EXIT SHORT | " + syminfo.ticker + 
+         " | Structure break — HH detected at " + str.tostring(close, format.mintick), 
+         alert.freq_once_per_bar)
+
+
+// ┌────────────────────────────────────────────────────────────┐
+// │                        VISUALS                             │
+// └────────────────────────────────────────────────────────────┘
+
+// ── Swing labels (offset back to actual swing bar) ──
+int ofs = -pivotLen
+
+plotshape(showSwings and isHH, "HH", shape.labeldown, location.abovebar, 
+     color.new(#00E676, 0),  text="HH", textcolor=color.white, size=size.tiny, offset=ofs)
+plotshape(showSwings and isHL, "HL", shape.labelup, location.belowbar, 
+     color.new(#00E676, 60), text="HL", textcolor=color.white, size=size.tiny, offset=ofs)
+plotshape(showSwings and isLH, "LH", shape.labeldown, location.abovebar, 
+     color.new(#FF1744, 60), text="LH", textcolor=color.white, size=size.tiny, offset=ofs)
+plotshape(showSwings and isLL, "LL", shape.labelup, location.belowbar, 
+     color.new(#FF1744, 0),  text="LL", textcolor=color.white, size=size.tiny, offset=ofs)
+
+// ── Entry / Exit signals ──
+plotshape(sigBuy  and okLong,  "BUY",   shape.triangleup,   location.belowbar, 
+     color.new(#00E676, 0), text="BUY",  textcolor=#00E676, size=size.normal)
+plotshape(sigSell and okShort, "SELL",  shape.triangledown, location.abovebar, 
+     color.new(#FF1744, 0), text="SELL", textcolor=#FF1744, size=size.normal)
+
+plotshape(sigExitL, "Exit L", shape.xcross, location.abovebar,
+     color.new(#FFA726, 0), text="EXIT", textcolor=#FFA726, size=size.small)
+plotshape(sigExitS, "Exit S", shape.xcross, location.belowbar,
+     color.new(#FFA726, 0), text="EXIT", textcolor=#FFA726, size=size.small)
+
+// ── Trend background shading ──
+color bgCol = showBG ? 
+     (iccState == 1 or iccState == 2 ? color.new(#00E676, 94) : 
+      iccState == 3 or iccState == 4 ? color.new(#FF1744, 94) : na) : na
+bgcolor(bgCol, title="ICC Trend Background")
+
+// ── HTF EMA line (when filter is on) ──
+plot(useHTF ? htfEma : na, "HTF EMA", color.new(color.yellow, 30), 2, plot.style_line)
+
+
+// ┌────────────────────────────────────────────────────────────┐
+// │                      DASHBOARD                             │
+// └────────────────────────────────────────────────────────────┘
+
+var table dash = table.new(position.top_right, 2, 6, 
+     bgcolor=color.new(#1E1E1E, 10), border_color=color.gray, border_width=1)
+
+if showDash and barstate.islast
+    string sText = switch iccState
+        0 => "Neutral"
+        1 => "🟢 Bull Indication"
+        2 => "🟢 Bull Correction"
+        3 => "🔴 Bear Indication"
+        4 => "🔴 Bear Correction"
+        => "—"
+    
+    string nextText = switch iccState
+        0 => "HH or LL (first indication)"
+        1 => "HL  → correction"
+        2 => "HH  → continuation = BUY ✅"
+        3 => "LH  → correction"
+        4 => "LL  → continuation = SELL ✅"
+        => "—"
+    
+    color sCol = (iccState == 1 or iccState == 2) ? #00E676 : 
+                 (iccState == 3 or iccState == 4) ? #FF1744 : color.gray
+    
+    string posText = strategy.position_size > 0 ? "LONG" : 
+                     strategy.position_size < 0 ? "SHORT" : "FLAT"
+    color  posCol  = strategy.position_size > 0 ? #00E676 : 
+                     strategy.position_size < 0 ? #FF1744 : color.gray
+
+    table.cell(dash, 0, 0, " ICC State ",       text_color=color.white,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 0, sText,               text_color=sCol,         text_size=size.small)
+    table.cell(dash, 0, 1, " Waiting For ",     text_color=color.white,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 1, nextText,            text_color=color.yellow,  text_size=size.small)
+    table.cell(dash, 0, 2, " Last Swing High ", text_color=color.white,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 2, str.tostring(currSH, format.mintick), text_color=#00E676, text_size=size.small)
+    table.cell(dash, 0, 3, " Last Swing Low ",  text_color=color.white,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 3, str.tostring(currSL, format.mintick), text_color=#FF1744, text_size=size.small)
+    table.cell(dash, 0, 4, " ATR(" + str.tostring(atrLen) + ") ",  text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 4, str.tostring(atrVal, format.mintick),    text_color=color.yellow, text_size=size.small)
+    table.cell(dash, 0, 5, " Position ",        text_color=color.white,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 5, posText,             text_color=posCol,       text_size=size.small)

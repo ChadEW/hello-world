@@ -1,0 +1,771 @@
+//@version=5
+// ============================================================================
+//  ICT_SMC_Strategy_v2.pine
+//  ICT 2022 Model + Trades-by-Sci Smart Money Structure Engine
+//  Pine v5 twin of  ICT_SMC_EA_v2_00.mq5  (parity build)
+//
+//  REPLACES ONLY the market-structure engine of ICT_2022Model_Strategy_v1.
+//  Preserved twins of the EA: dashboard, money management (% risk sizing),
+//  trade management (OTE entry / SL / TP / expiry), all inputs, and the
+//  ICC state machine (IDLE -> SWEPT -> ARMED).
+//
+//  NEW Smart Money engine (mirrors the MQL5 v2.00 module):
+//    1. Protected swing detection (internal + external fractals)
+//    2. Liquidity engine (BSL/SSL, equal H/L, sweep + reclaim)
+//    3. Fair Value Gaps (detect all, draw, fill %, pullback requirement)
+//    4. Institutional displacement scoring (ATR/body/close/wick -> 0..100)
+//    5. Dual market structure (external=direction, internal=entry)
+//    6. Order / mitigation blocks (Trades-by-Sci enhancement)
+//
+//  DRY-RUN note (unchanged platform caveat): a Pine strategy is always a
+//  simulation. InpDryRun=true suppresses alert(); false fires order intent
+//  to a broker webhook. Live auto-execution runs only through the MQL5 EA.
+// ============================================================================
+strategy("ICT+SMC Strategy v2", overlay=true,
+     initial_capital        = 10000,
+     default_qty_type       = strategy.percent_of_equity,
+     default_qty_value      = 100,
+     pyramiding             = 0,
+     calc_on_every_tick     = false,
+     process_orders_on_close= true,
+     max_boxes_count        = 500,
+     max_lines_count        = 500,
+     max_labels_count       = 100)
+
+// ============================================================================
+//  INPUTS  (original ICT inputs preserved)
+// ============================================================================
+grpGen = "General"
+InpRiskPercent     = input.float(1.0,  "Risk per trade (%)", group=grpGen, minval=0.1)
+InpMaxTradesPerDay = input.int(2,      "Max entries per day", group=grpGen, minval=1)
+InpUseAutoBias     = input.bool(true,  "Auto daily bias (D1 struct + PD eq)", group=grpGen)
+InpManualBias      = input.int(0,      "Manual bias (0=auto,1=long,-1=short)", group=grpGen, minval=-1, maxval=1)
+InpDryRun          = input.bool(true,  "DRY-RUN: backtest only, NO alert() fired", group=grpGen)
+
+grpKZ = "Kill Zones (America/New_York)"
+tzNY          = "America/New_York"
+InpTradeLondonKZ     = input.bool(true, "London Open KZ 02:00-05:00", group=grpKZ)
+InpTradeNYAMKZ       = input.bool(true, "New York AM KZ 08:30-11:00", group=grpKZ)
+InpTradeSilverBullet = input.bool(true, "Silver Bullet 10:00-11:00", group=grpKZ)
+
+grpLiqOld = "Liquidity Sweep"
+InpSwingLookback = input.int(12,  "Swing pool lookback", group=grpLiqOld, minval=2)
+InpUsePDHPDL     = input.bool(true,"Include Previous Day High/Low", group=grpLiqOld)
+InpSweepMinPips  = input.float(1.0,"Min penetration beyond level (pips)", group=grpLiqOld)
+
+grpMSS = "Displacement / MSS / FVG"
+InpMSSLookback     = input.int(6,   "MSS structure lookback", group=grpMSS, minval=2)
+InpMinDisplacePips = input.float(8.0,"Min displacement candle range (pips)", group=grpMSS)
+InpMinFVGPips      = input.float(1.0,"Min Fair Value Gap size (pips)", group=grpMSS)
+InpSetupExpiryBars = input.int(12,  "Cancel setup if unfilled (bars)", group=grpMSS, minval=1)
+
+grpOTE = "OTE / Entry (ICT Fibonacci)"
+InpOTE_Start        = input.float(0.62,  "OTE zone start", group=grpOTE)
+InpOTE_Optimal      = input.float(0.705, "OTE sweet spot", group=grpOTE)
+InpOTE_End          = input.float(0.79,  "OTE zone end", group=grpOTE)
+InpEntryAtOptimal   = input.bool(true,   "Limit at 0.705 (else mid of zone)", group=grpOTE)
+InpRequireFVGoverlap= input.bool(true,   "OTE must sit inside entry zone", group=grpOTE)
+
+grpST = "Stops & Targets"
+InpStopBufferPips  = input.float(2.0, "Buffer beyond sweep wick (pips)", group=grpST)
+InpTargetMode      = input.string("Opposite Liquidity", "Target mode", options=["Opposite Liquidity","RR Multiple","Std-Dev Projection"], group=grpST)
+InpRRMultiple      = input.float(3.0, "RR multiple (mode=RR)", group=grpST)
+InpStdDevProjection= input.float(2.0, "Std-dev projection (mode=StdDev)", group=grpST)
+
+// ---------------------------------------------------------------------------
+//  NEW INPUTS — SMC engine (names mirror the MQL5 v2.00 EA)
+// ---------------------------------------------------------------------------
+grpStr = "SMC: Protected Swings / Structure"
+InpIntSwingStrength    = input.int(2,   "Internal swing strength (bars each side)", group=grpStr, minval=1)
+InpExtSwingStrength    = input.int(4,   "External swing strength (bars each side)", group=grpStr, minval=1)
+InpStructLookback      = input.int(300, "Bars scanned for protected swings", group=grpStr, minval=20)
+InpBOSUseClose         = input.bool(true,"BOS requires BODY close beyond swing", group=grpStr)
+InpExtTrendControlsDir = input.bool(true,"External trend gates trade DIRECTION", group=grpStr)
+InpIntTrendControlsEntry=input.bool(true,"Internal BOS gates ENTRY trigger", group=grpStr)
+
+grpLiq = "SMC: Liquidity Engine"
+InpLiqLookback     = input.int(120, "Bars scanned for pools / equal levels", group=grpLiq, minval=10)
+InpEqualLevelTolPips=input.float(2.0,"Equal highs/lows tolerance (pips)", group=grpLiq)
+InpRequireReclaim  = input.bool(true,"Require liquidity RECLAIM after sweep", group=grpLiq)
+InpReclaimBars     = input.int(3,   "Bars allowed for reclaim", group=grpLiq, minval=1)
+
+grpFVG = "SMC: Fair Value Gaps"
+InpDrawFVG          = input.bool(true, "Draw detected FVGs", group=grpFVG)
+InpFVGScanBars      = input.int(120,   "Bars scanned each update for FVGs", group=grpFVG, minval=10)
+InpMaxTrackedFVG    = input.int(30,    "Max FVGs tracked", group=grpFVG, minval=1)
+InpFVGFillInvalidate= input.float(100.0,"Fill % that retires an FVG", group=grpFVG)
+InpRequireFVGpullback=input.bool(true, "Entry MUST pull back into an active FVG", group=grpFVG)
+InpFVGBullColor     = input.color(color.new(color.teal,80),  "Bullish FVG colour", group=grpFVG)
+InpFVGBearColor     = input.color(color.new(color.maroon,80),"Bearish FVG colour", group=grpFVG)
+
+grpDisp = "SMC: Institutional Displacement"
+InpDispATRPeriod   = input.int(14,   "ATR period for displacement", group=grpDisp, minval=1)
+InpDispATRMult     = input.float(1.5,"Range >= ATR*mult = full ATR points", group=grpDisp)
+InpDispMinBodyPct  = input.float(0.50,"Min body/range", group=grpDisp)
+InpDispMinCloseStr = input.float(0.60,"Min closing strength", group=grpDisp)
+InpDispMaxWickRatio= input.float(1.00,"Max opposing-wick/body ratio", group=grpDisp)
+InpDispMinScore    = input.float(60.0,"Reject displacement below score (0..100)", group=grpDisp)
+
+grpOB = "SMC: Order / Mitigation Blocks"
+InpUseOrderBlocks   = input.bool(true, "Enable order-block detection & requirement", group=grpOB)
+InpRequireOBoverlap = input.bool(true, "Entry MUST sit inside an unmitigated OB", group=grpOB)
+InpOBScanBack       = input.int(8,     "Bars searched back from displacement for OB", group=grpOB, minval=1)
+InpMaxTrackedOB     = input.int(30,    "Max order blocks tracked", group=grpOB, minval=1)
+InpOBMitigateOnClose= input.bool(true, "OB invalidated on BODY close through", group=grpOB)
+InpDrawOB           = input.bool(true, "Draw order blocks", group=grpOB)
+InpOBBullColor      = input.color(color.new(color.green,70),"Bullish OB colour", group=grpOB)
+InpOBBearColor      = input.color(color.new(color.red,70),  "Bearish OB colour", group=grpOB)
+
+grpViz = "Dashboard"
+InpShowDashboard = input.bool(true, "Show dashboard", group=grpViz)
+
+// ============================================================================
+//  PIP SIZE  (mirror EA: 10 minticks on 5/3-digit symbols, else 1 mintick)
+// ============================================================================
+pip = (syminfo.mintick == 0.00001 or syminfo.mintick == 0.001) ? syminfo.mintick * 10 : syminfo.mintick
+
+// ============================================================================
+//  ATR (displacement normalisation)
+// ============================================================================
+atr = ta.atr(InpDispATRPeriod)
+
+// ============================================================================
+//  1. DAILY BIAS  (HTF D1 structure + previous-day equilibrium) — preserved
+// ============================================================================
+pdh  = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+d1h1 = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+d1h2 = request.security(syminfo.tickerid, "D", high[2], lookahead=barmerge.lookahead_on)
+d1l1 = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+d1l2 = request.security(syminfo.tickerid, "D", low[2],  lookahead=barmerge.lookahead_on)
+
+computeBias() =>
+    eq = (pdh + pdl) / 2.0
+    px = close
+    structBias = (d1h1 > d1h2 and d1l1 > d1l2) ? 1 : (d1h1 < d1h2 and d1l1 < d1l2) ? -1 : 0
+    pdBias = px < eq ? 1 : px > eq ? -1 : 0
+    (structBias != 0 and structBias == pdBias) ? structBias : structBias != 0 ? structBias : 0
+
+dailyBias = InpUseAutoBias ? computeBias() : InpManualBias
+
+// ============================================================================
+//  2. KILL ZONE  (New York local time) — preserved
+// ============================================================================
+inSession(sH, sM, eH, eM) =>
+    t = hour(time, tzNY) * 60 + minute(time, tzNY)
+    s = sH * 60 + sM
+    e = eH * 60 + eM
+    t >= s and t < e
+
+inKZ = (InpTradeLondonKZ and inSession(2,0,5,0)) or (InpTradeNYAMKZ and inSession(8,30,11,0)) or (InpTradeSilverBullet and inSession(10,0,11,0))
+
+// ============================================================================
+//  PROTECTED SWING DETECTION  (fractals of a given strength)
+//  Returns most-recent confirmed swing high/low = the protected swings.
+// ============================================================================
+isFractalHigh(int shift, int strength) =>
+    bool ok = true
+    h = high[shift]
+    for k = 1 to strength
+        if high[shift + k] >= h or high[shift - k] >= h
+            ok := false
+            break
+    ok
+
+isFractalLow(int shift, int strength) =>
+    bool ok = true
+    l = low[shift]
+    for k = 1 to strength
+        if low[shift + k] <= l or low[shift - k] <= l
+            ok := false
+            break
+    ok
+
+// Scan back for the newest confirmed protected high & low at 'strength'.
+findProtected(int strength) =>
+    float pH = na
+    float pL = na
+    int maxBars = math.min(InpStructLookback, bar_index - (strength + 2))
+    for s = strength + 1 to maxBars
+        if na(pH) and isFractalHigh(s, strength)
+            pH := high[s]
+        if na(pL) and isFractalLow(s, strength)
+            pL := low[s]
+        if not na(pH) and not na(pL)
+            break
+    [pH, pL]
+
+// ============================================================================
+//  DUAL MARKET STRUCTURE  (external = direction, internal = entry)
+//  BOS is only measured against a PROTECTED swing.
+// ============================================================================
+var int extTrend = 0
+var int intTrend = 0
+var float extProtHigh = na
+var float extProtLow  = na
+var float intProtHigh = na
+var float intProtLow  = na
+
+[eH_, eL_] = findProtected(InpExtSwingStrength)
+[iH_, iL_] = findProtected(InpIntSwingStrength)
+extProtHigh := eH_
+extProtLow  := eL_
+intProtHigh := iH_
+intProtLow  := iL_
+
+bosRef = InpBOSUseClose ? close[1] : na
+extBreakH = InpBOSUseClose ? close[1] : high[1]
+extBreakL = InpBOSUseClose ? close[1] : low[1]
+
+if not na(extProtHigh) and extBreakH > extProtHigh
+    extTrend := 1
+else if not na(extProtLow) and extBreakL < extProtLow
+    extTrend := -1
+
+if not na(intProtHigh) and extBreakH > intProtHigh
+    intTrend := 1
+else if not na(intProtLow) and extBreakL < intProtLow
+    intTrend := -1
+
+// ============================================================================
+//  LIQUIDITY ENGINE  (BSL/SSL, equal highs/lows, sweep, reclaim)
+// ============================================================================
+// Equal-highs / equal-lows magnets among recent fractals.
+detectEqualHighs() =>
+    float lvl = na
+    float first = na
+    str = InpExtSwingStrength
+    tol = InpEqualLevelTolPips * pip
+    for s = str + 1 to InpLiqLookback
+        if isFractalHigh(s, str)
+            h = high[s]
+            if na(first)
+                first := h
+            else if math.abs(h - first) <= tol
+                lvl := (h + first) / 2.0
+                break
+            else
+                first := h
+    lvl
+
+detectEqualLows() =>
+    float lvl = na
+    float first = na
+    str = InpExtSwingStrength
+    tol = InpEqualLevelTolPips * pip
+    for s = str + 1 to InpLiqLookback
+        if isFractalLow(s, str)
+            l = low[s]
+            if na(first)
+                first := l
+            else if math.abs(l - first) <= tol
+                lvl := (l + first) / 2.0
+                break
+            else
+                first := l
+    lvl
+
+// Composite buy-side / sell-side liquidity levels.
+poolHigh = ta.highest(high[2], InpSwingLookback)
+poolLow  = ta.lowest(low[2],  InpSwingLookback)
+eqH = detectEqualHighs()
+eqL = detectEqualLows()
+
+buildBSL() =>
+    float lvl = na(extProtHigh) ? poolHigh : math.max(extProtHigh, poolHigh)
+    lvl := na(eqH) ? lvl : math.max(lvl, eqH)
+    lvl := InpUsePDHPDL ? math.max(lvl, pdh) : lvl
+    lvl
+
+buildSSL() =>
+    float lvl = na(extProtLow) ? poolLow : math.min(extProtLow, poolLow)
+    lvl := na(eqL) ? lvl : math.min(lvl, eqL)
+    lvl := InpUsePDHPDL ? math.min(lvl, pdl) : lvl
+    lvl
+
+bsl = buildBSL()
+ssl = buildSSL()
+buf = InpSweepMinPips * pip
+
+// A sweep = wick beyond the pool + close back on the origin side (rejection).
+sweptSSL = (low[1]  < ssl - buf) and (close[1] > ssl)   // sell-side raid -> LONG
+sweptBSL = (high[1] > bsl + buf) and (close[1] < bsl)   // buy-side  raid -> SHORT
+
+// Reclaim confirmation across the last N bars.
+reclaimLong  = not InpRequireReclaim or (close[1] > ssl or close[2] > ssl or close[3] > ssl)
+reclaimShort = not InpRequireReclaim or (close[1] < bsl or close[2] < bsl or close[3] < bsl)
+
+// ============================================================================
+//  INSTITUTIONAL DISPLACEMENT SCORING  (ATR + body% + close str + wick)
+// ============================================================================
+scoreDisplacement(int shift, int dir) =>
+    o = open[shift]
+    c = close[shift]
+    h = high[shift]
+    l = low[shift]
+    rng = h - l
+    float score = 0.0
+    if rng > 0
+        dirOk = dir == 1 ? c > o : c < o
+        if dirOk
+            body     = math.abs(c - o)
+            bodyPct  = body / rng
+            closeStr = dir == 1 ? (c - l) / rng : (h - c) / rng
+            oppWick  = dir == 1 ? (h - c) : (c - l)
+            wickRat  = body > 0 ? oppWick / body : 999.0
+            atrFac   = atr > 0 ? rng / atr : 0.0
+            sBody  = math.min(bodyPct  / math.max(InpDispMinBodyPct , 0.01), 1.0) * 30.0
+            sClose = math.min(closeStr / math.max(InpDispMinCloseStr, 0.01), 1.0) * 25.0
+            sWick  = math.min(InpDispMaxWickRatio / math.max(wickRat, 0.0001), 1.0) * 15.0
+            sATR   = math.min(atrFac   / math.max(InpDispATRMult   , 0.01), 1.0) * 30.0
+            score  := math.min(sBody + sClose + sWick + sATR, 100.0)
+    score
+
+// ============================================================================
+//  FAIR VALUE GAP ENGINE  (detect all, draw, track fill %, retire)
+//  Arrays act as the struct store (parity with the EA's SFVG[]).
+// ============================================================================
+var float[]    fvgTopA  = array.new_float()
+var float[]    fvgBotA  = array.new_float()
+var int[]      fvgDirA  = array.new_int()
+var float[]    fvgFillA = array.new_float()
+var bool[]     fvgActA  = array.new_bool()
+var int[]      fvgBarA  = array.new_int()
+var box[]      fvgBoxA  = array.new_box()
+
+addFVG(float top, float bot, int dir, int bidx) =>
+    if array.size(fvgTopA) >= InpMaxTrackedFVG
+        if array.size(fvgBoxA) > 0
+            b = array.shift(fvgBoxA)
+            box.delete(b)
+        array.shift(fvgTopA), array.shift(fvgBotA), array.shift(fvgDirA)
+        array.shift(fvgFillA), array.shift(fvgActA), array.shift(fvgBarA)
+    array.push(fvgTopA, top)
+    array.push(fvgBotA, bot)
+    array.push(fvgDirA, dir)
+    array.push(fvgFillA, 0.0)
+    array.push(fvgActA, true)
+    array.push(fvgBarA, bidx)
+    bx = InpDrawFVG ? box.new(bidx, top, bar_index, bot, border_color=na, bgcolor=(dir==1?InpFVGBullColor:InpFVGBearColor)) : na
+    array.push(fvgBoxA, bx)
+
+// Detect the freshly-completed 3-candle imbalance on the last closed bar.
+newBullFVG = (low[1] - high[3]) / pip >= InpMinFVGPips
+newBearFVG = (high[1] - low[3]) / pip >= InpMinFVGPips   // note: bearish gap = low[3]-high[1]; kept explicit below
+bearGap    = (low[3] - high[1]) / pip
+if barstate.isconfirmed
+    if newBullFVG
+        addFVG(low[1], high[3], 1, bar_index - 2)
+    if bearGap >= InpMinFVGPips
+        addFVG(low[3], high[1], -1, bar_index - 2)   // top=low[3], bot=high[1]
+
+// Update fill % and retire filled FVGs; keep boxes tracking the current bar.
+updateFVGs() =>
+    for i = 0 to array.size(fvgTopA) - 1
+        if array.get(fvgActA, i)
+            top = array.get(fvgTopA, i)
+            bot = array.get(fvgBotA, i)
+            span = top - bot
+            if span <= 0
+                array.set(fvgActA, i, false)
+            else
+                pct = array.get(fvgFillA, i)
+                if array.get(fvgDirA, i) == 1
+                    if low[1] < top
+                        pen = top - math.max(low[1], bot)
+                        pct := math.max(pct, 100.0 * pen / span)
+                else
+                    if high[1] > bot
+                        pen = math.min(high[1], top) - bot
+                        pct := math.max(pct, 100.0 * pen / span)
+                array.set(fvgFillA, i, pct)
+                if pct >= InpFVGFillInvalidate
+                    array.set(fvgActA, i, false)
+            b = array.get(fvgBoxA, i)
+            if not na(b)
+                if array.get(fvgActA, i)
+                    box.set_right(b, bar_index)
+                else
+                    box.delete(b)
+                    array.set(fvgBoxA, i, na)
+updateFVGs()
+
+// Nearest active FVG in the trade direction (bullish for longs, bearish shorts).
+nearestFVG(int tradeDir) =>
+    int best = -1
+    float bestD = 1e20
+    px = close[1]
+    for i = 0 to array.size(fvgTopA) - 1
+        if array.get(fvgActA, i) and array.get(fvgDirA, i) == tradeDir
+            mid = (array.get(fvgTopA, i) + array.get(fvgBotA, i)) / 2.0
+            d = math.abs(px - mid)
+            if d < bestD
+                bestD := d
+                best  := i
+    best
+
+// ============================================================================
+//  ORDER / MITIGATION BLOCK ENGINE  (Trades-by-Sci enhancement)
+// ============================================================================
+var float[] obTopA = array.new_float()
+var float[] obBotA = array.new_float()
+var int[]   obDirA = array.new_int()
+var bool[]  obMitA = array.new_bool()
+var bool[]  obActA = array.new_bool()
+var box[]   obBoxA = array.new_box()
+
+addOB(float top, float bot, int dir, int bidx) =>
+    if array.size(obTopA) >= InpMaxTrackedOB
+        if array.size(obBoxA) > 0
+            b = array.shift(obBoxA)
+            box.delete(b)
+        array.shift(obTopA), array.shift(obBotA), array.shift(obDirA)
+        array.shift(obMitA), array.shift(obActA)
+    array.push(obTopA, top)
+    array.push(obBotA, bot)
+    array.push(obDirA, dir)
+    array.push(obMitA, false)
+    array.push(obActA, true)
+    bx = InpDrawOB ? box.new(bidx, top, bar_index, bot, border_color=(dir==1?InpOBBullColor:InpOBBearColor), bgcolor=na, border_width=2) : na
+    array.push(obBoxA, bx)
+
+// On a scored displacement at bar[1], register the originating order block:
+// bullish OB = last down-close candle before an up displacement (and inverse).
+if InpUseOrderBlocks and barstate.isconfirmed
+    if scoreDisplacement(1, 1) >= InpDispMinScore
+        for k = 2 to InpOBScanBack + 1
+            if close[k] < open[k]
+                addOB(high[k], low[k], 1, bar_index - k)
+                break
+    if scoreDisplacement(1, -1) >= InpDispMinScore
+        for k = 2 to InpOBScanBack + 1
+            if close[k] > open[k]
+                addOB(high[k], low[k], -1, bar_index - k)
+                break
+
+// Mitigation (touch) + invalidation (opposing close-through).
+updateOBs() =>
+    for i = 0 to array.size(obTopA) - 1
+        if array.get(obActA, i)
+            top = array.get(obTopA, i)
+            bot = array.get(obBotA, i)
+            if array.get(obDirA, i) == 1
+                if low[1] <= top and high[1] >= bot
+                    array.set(obMitA, i, true)
+                thru = InpOBMitigateOnClose ? close[1] : low[1]
+                if thru < bot
+                    array.set(obActA, i, false)
+            else
+                if high[1] >= bot and low[1] <= top
+                    array.set(obMitA, i, true)
+                thru = InpOBMitigateOnClose ? close[1] : high[1]
+                if thru > top
+                    array.set(obActA, i, false)
+            b = array.get(obBoxA, i)
+            if not na(b)
+                if array.get(obActA, i)
+                    box.set_right(b, bar_index)
+                    box.set_border_style(b, array.get(obMitA, i) ? line.style_dotted : line.style_solid)
+                else
+                    box.delete(b)
+                    array.set(obBoxA, i, na)
+updateOBs()
+
+nearestOB(int tradeDir) =>
+    int best = -1
+    float bestD = 1e20
+    px = close[1]
+    for i = 0 to array.size(obTopA) - 1
+        if array.get(obActA, i) and not array.get(obMitA, i) and array.get(obDirA, i) == tradeDir
+            mid = (array.get(obTopA, i) + array.get(obBotA, i)) / 2.0
+            d = math.abs(px - mid)
+            if d < bestD
+                bestD := d
+                best  := i
+    best
+
+// ============================================================================
+//  ENTRY-ZONE BUILDER  (intersect required FVG and/or unmitigated OB)
+//  Returns [ok, zoneBot, zoneTop] consumed by the preserved ArmSetup logic.
+// ============================================================================
+buildEntryZone(int tradeDir) =>
+    bool ok = true
+    float zBot = na
+    float zTop = na
+    bool haveF = false
+    bool haveO = false
+    float fB = na, fT = na, oB = na, oT = na
+
+    fi = nearestFVG(tradeDir)
+    if fi >= 0
+        fB := array.get(fvgBotA, fi)
+        fT := array.get(fvgTopA, fi)
+        haveF := true
+    else if InpRequireFVGpullback
+        ok := false
+
+    if ok and InpUseOrderBlocks and InpRequireOBoverlap
+        oi = nearestOB(tradeDir)
+        if oi >= 0
+            oB := array.get(obBotA, oi)
+            oT := array.get(obTopA, oi)
+            haveO := true
+        else
+            ok := false
+
+    if ok
+        if haveF and haveO
+            zBot := math.max(fB, oB)
+            zTop := math.min(fT, oT)
+            if zBot >= zTop
+                ok := false
+        else if haveF
+            zBot := fB
+            zTop := fT
+        else if haveO
+            zBot := oB
+            zTop := oT
+        else
+            ok := false
+    [ok, zBot, zTop]
+
+// ============================================================================
+//  STATE MACHINE  (ICC workflow — preserved skeleton; engine-driven bodies)
+// ============================================================================
+var int    state       = 0        // 0 idle, 1 swept, 2 armed
+var int    setupDir    = 0
+var float  sweepWick   = na
+var float  dispExtreme = na
+var float  fvgTop      = na
+var float  fvgBot      = na
+var int    setupBar    = 0
+var float  oteEntry    = na
+var float  oteSL       = na
+var float  oteTP       = na
+var int    tradesToday = 0
+var int    lastDay     = na
+var float  lastDispScore = 0.0
+var string liqStatus   = "watching pools"
+
+resetSetup() =>
+    state       := 0
+    setupDir    := 0
+    sweepWick   := na
+    dispExtreme := na
+    fvgTop      := na
+    fvgBot      := na
+    setupBar    := 0
+    oteEntry    := na
+    oteSL       := na
+    oteTP       := na
+    liqStatus   := "watching pools"
+
+// daily counter roll
+curDay = dayofmonth(time, tzNY)
+if curDay != lastDay
+    lastDay := curDay
+    tradesToday := 0
+
+canTrade = barstate.isconfirmed and inKZ and (tradesToday < InpMaxTradesPerDay) and (strategy.opentrades == 0)
+
+// ---- direction gate: external trend + preserved daily-bias veto ----
+allowLong  = true
+allowShort = true
+if InpExtTrendControlsDir and extTrend != 0
+    allowLong  := extTrend == 1
+    allowShort := extTrend == -1
+if dailyBias > 0
+    allowShort := false
+if dailyBias < 0
+    allowLong  := false
+
+// ---- INDICATION: liquidity sweep + reclaim -> SWEPT ----
+if canTrade and state == 0
+    if allowLong and sweptSSL and reclaimLong
+        setupDir := 1
+        sweepWick := low[1]
+        liqStatus := "SSL swept + reclaim"
+        state := 1
+        setupBar := 0
+    else if allowShort and sweptBSL and reclaimShort
+        setupDir := -1
+        sweepWick := high[1]
+        liqStatus := "BSL swept + reclaim"
+        state := 1
+        setupBar := 0
+
+// ---- CORRECTION: scored displacement + internal BOS -> build zone -> ARM ----
+if state == 1
+    setupBar += 1
+    if setupBar > InpSetupExpiryBars
+        resetSetup()
+    else if not inKZ
+        resetSetup()
+    else
+        score = scoreDisplacement(1, setupDir)
+        lastDispScore := score
+        range1 = (high[1] - low[1]) / pip
+        if score >= InpDispMinScore and range1 >= InpMinDisplacePips
+            c1 = close[1]
+            intBOS = true
+            if InpIntTrendControlsEntry
+                intBOS := setupDir == 1 ? (not na(intProtHigh) and c1 > intProtHigh) : (not na(intProtLow) and c1 < intProtLow)
+            extOk = not (InpExtTrendControlsDir and extTrend != 0 and extTrend != setupDir)
+            if intBOS and extOk
+                dispExtreme := setupDir == 1 ? high[1] : low[1]
+                [zok, zBot, zTop] = buildEntryZone(setupDir)
+                if zok
+                    fvgBot := zBot
+                    fvgTop := zTop
+                else
+                    // fallback: classic inline displacement FVG (original behaviour)
+                    if setupDir == 1 and (low[1] - high[3]) / pip >= InpMinFVGPips
+                        fvgBot := high[3]
+                        fvgTop := low[1]
+                    else if setupDir == -1 and (low[3] - high[1]) / pip >= InpMinFVGPips
+                        fvgTop := low[3]
+                        fvgBot := high[1]
+                // arm only when a zone exists
+                if not na(fvgTop) and not na(fvgBot)
+                    state := 2
+            else if not extOk
+                resetSetup()
+
+// ============================================================================
+//  5/6. OTE ENTRY + STOP + TARGET  (preserved trade-management twin)
+// ============================================================================
+computeTarget(int dir, float entry, float sl, float dist) =>
+    risk = math.abs(entry - sl)
+    float tgt = 0.0
+    if InpTargetMode == "RR Multiple"
+        tgt := dir == 1 ? entry + InpRRMultiple * risk : entry - InpRRMultiple * risk
+    else if InpTargetMode == "Std-Dev Projection"
+        proj = math.abs(InpStdDevProjection) * dist
+        tgt := dir == 1 ? sweepWick + proj : sweepWick - proj
+    else
+        if dir == 1
+            oppo = ta.highest(high, InpSwingLookback * 2)
+            t = math.max(oppo, pdh)
+            tgt := t > entry ? t : entry + InpRRMultiple * risk
+        else
+            oppo = ta.lowest(low, InpSwingLookback * 2)
+            t = math.min(oppo, pdl)
+            tgt := t < entry ? t : entry - InpRRMultiple * risk
+    tgt
+
+if state == 2 and na(oteEntry)
+    lo   = math.min(sweepWick, dispExtreme)
+    hi   = math.max(sweepWick, dispExtreme)
+    dist = hi - lo
+    if dist > 0
+        float entry = 0.0
+        float sl = 0.0
+        bool valid = true
+        if setupDir == 1
+            zS = dispExtreme - InpOTE_Start * dist
+            zE = dispExtreme - InpOTE_End   * dist
+            entry := InpEntryAtOptimal ? (dispExtreme - InpOTE_Optimal * dist) : (zS + zE) / 2.0
+            if InpRequireFVGoverlap and not (entry <= fvgTop and entry >= fvgBot)
+                if entry > fvgTop
+                    entry := fvgTop
+                else
+                    valid := false
+            sl := sweepWick - InpStopBufferPips * pip
+        else
+            zS = dispExtreme + InpOTE_Start * dist
+            zE = dispExtreme + InpOTE_End   * dist
+            entry := InpEntryAtOptimal ? (dispExtreme + InpOTE_Optimal * dist) : (zS + zE) / 2.0
+            if InpRequireFVGoverlap and not (entry <= fvgTop and entry >= fvgBot)
+                if entry < fvgBot
+                    entry := fvgBot
+                else
+                    valid := false
+            sl := sweepWick + InpStopBufferPips * pip
+        if valid
+            tp = computeTarget(setupDir, entry, sl, dist)
+            oteEntry := entry
+            oteSL    := sl
+            oteTP    := tp
+            slPips = math.abs(entry - sl) / pip
+            riskMoney = strategy.equity * (InpRiskPercent / 100.0)
+            qty = slPips > 0 ? riskMoney / (slPips * (pip / syminfo.mintick) * syminfo.pointvalue) : na
+            if setupDir == 1
+                strategy.entry("ICT_L", strategy.long, limit=entry, qty=qty)
+                strategy.exit("ICT_L_x", "ICT_L", stop=sl, limit=tp)
+            else
+                strategy.entry("ICT_S", strategy.short, limit=entry, qty=qty)
+                strategy.exit("ICT_S_x", "ICT_S", stop=sl, limit=tp)
+            if not InpDryRun
+                dirTxt = setupDir == 1 ? "LONG" : "SHORT"
+                alert(dirTxt + " OTE @ " + str.tostring(entry, format.mintick) + "  SL " + str.tostring(sl, format.mintick) + "  TP " + str.tostring(tp, format.mintick), alert.freq_once_per_bar)
+        else
+            resetSetup()
+
+// count fills & free engine for next setup
+if state == 2 and strategy.opentrades > 0
+    tradesToday += 1
+    resetSetup()
+
+// expire unfilled pending when KZ ends
+if state == 2 and not inKZ and strategy.opentrades == 0
+    strategy.cancel("ICT_L")
+    strategy.cancel("ICT_S")
+    resetSetup()
+
+// ============================================================================
+//  VISUALS
+// ============================================================================
+plot(bsl, "BSL", color=color.new(color.red,60),   style=plot.style_stepline)
+plot(ssl, "SSL", color=color.new(color.green,60),  style=plot.style_stepline)
+plot(extProtHigh, "Protected High", color=color.new(color.orange,40), style=plot.style_circles)
+plot(extProtLow,  "Protected Low",  color=color.new(color.aqua,40),   style=plot.style_circles)
+bgcolor(inKZ ? color.new(color.yellow, 92) : na, title="Kill Zone shade")
+
+// ============================================================================
+//  DASHBOARD  (extended with the 8 required SMC fields)
+// ============================================================================
+nearestFVGtext(int dir) =>
+    idx = nearestFVG(dir)
+    idx < 0 ? "none" : str.tostring(array.get(fvgBotA, idx), format.mintick) + " - " + str.tostring(array.get(fvgTopA, idx), format.mintick) + "  (" + str.tostring(math.round(array.get(fvgFillA, idx))) + "% filled)"
+
+if InpShowDashboard and barstate.islast
+    var table dash = table.new(position.top_right, 2, 13, border_width=1)
+    biasTxt  = dailyBias == 1 ? "BULLISH" : dailyBias == -1 ? "BEARISH" : "NONE"
+    biasCol  = dailyBias == 1 ? color.lime : dailyBias == -1 ? color.red : color.silver
+    extTxt   = extTrend == 1 ? "BULLISH" : extTrend == -1 ? "BEARISH" : "NONE"
+    extCol   = extTrend == 1 ? color.lime : extTrend == -1 ? color.red : color.silver
+    intTxt   = intTrend == 1 ? "BULLISH" : intTrend == -1 ? "BEARISH" : "NONE"
+    intCol   = intTrend == 1 ? color.lime : intTrend == -1 ? color.red : color.silver
+    stateTxt = state == 0 ? "IDLE (await sweep)" : state == 1 ? "SWEPT (await displacement)" : "ARMED (OTE set)"
+    modeTxt  = InpDryRun ? "DRY-RUN" : "LIVE (alerts)"
+    nyTxt    = str.format("{0,number,00}:{1,number,00} NY", hour(time, tzNY), minute(time, tzNY))
+
+    table.cell(dash, 0, 0, "ICT+SMC v2  [" + modeTxt + "]", text_color=color.black, bgcolor=color.gold, text_size=size.normal)
+    table.cell(dash, 1, 0, "", bgcolor=color.gold)
+    table.cell(dash, 0, 1, "NY time",  text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 1, nyTxt + (inKZ ? "  [KZ]" : ""), text_color=inKZ?color.lime:color.silver, bgcolor=color.gray)
+    table.cell(dash, 0, 2, "Daily bias", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 2, biasTxt, text_color=biasCol, bgcolor=color.gray)
+    table.cell(dash, 0, 3, "External trend", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 3, extTxt, text_color=extCol, bgcolor=color.gray)
+    table.cell(dash, 0, 4, "Internal trend", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 4, intTxt, text_color=intCol, bgcolor=color.gray)
+    table.cell(dash, 0, 5, "Protected High", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 5, na(extProtHigh)?"-":str.tostring(extProtHigh, format.mintick), text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 0, 6, "Protected Low", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 6, na(extProtLow)?"-":str.tostring(extProtLow, format.mintick), text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 0, 7, "Liquidity", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 7, liqStatus, text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 0, 8, "Displacement", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 8, str.tostring(math.round(lastDispScore)) + "/100", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 0, 9, "Nearest Bull FVG", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 9, nearestFVGtext(1), text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 0, 10, "Nearest Bear FVG", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 10, nearestFVGtext(-1), text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 0, 11, "State", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 11, stateTxt, text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 0, 12, "Trades today", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 12, str.tostring(tradesToday) + "/" + str.tostring(InpMaxTradesPerDay), text_color=color.white, bgcolor=color.gray)
+// ============================================================================
+//  END ICT_SMC_Strategy_v2.pine
+// ============================================================================

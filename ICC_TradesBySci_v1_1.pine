@@ -1,0 +1,223 @@
+//@version=6
+// =====================================================================
+// ICC (Indication -> Correction -> Continuation) — Trades By Sci Style
+// Multi-Timeframe Cascade: D1 -> H4 -> H1 -> 15m with correlation gate
+// Author: built for Chad Woodyard, June 2026
+// v1.1  — hardened against Pine v6 line-continuation gotchas
+//         (all chained ternaries and wrapped booleans flattened)
+// Color scheme honors TradesBySci: swing highs (sellers) = BLUE,
+//   swing lows (buyers) = RED, correction zones shaded by bias.
+// =====================================================================
+indicator("ICC TradesBySci Cascade [v1.1]",
+     shorttitle       = "ICC-Sci",
+     overlay          = true,
+     max_lines_count  = 500,
+     max_labels_count = 500,
+     max_boxes_count  = 500)
+
+// ---------- INPUTS ---------------------------------------------------
+grpStruct = "Structure / Swing Detection"
+swingLen   = input.int(5,    "Swing pivot length (bars L/R)", minval = 2, group = grpStruct, tooltip = "Bars on each side of a pivot. 5 ~ Sci's clean H1 swings.")
+showLabels = input.bool(true,"Show HH / HL / LH / LL labels",   group = grpStruct)
+maxSwings  = input.int(6,    "Max recent swing lines kept",     minval = 2, maxval = 20, group = grpStruct)
+
+grpCol    = "Color Scheme (Sci style)"
+colHigh    = input.color(color.new(#1E88E5, 0),  "Swing High (sellers' line)", group = grpCol)
+colLow     = input.color(color.new(#E53935, 0),  "Swing Low (buyers' line)",   group = grpCol)
+colBull    = input.color(color.new(color.green, 80), "Bullish correction zone", group = grpCol)
+colBear    = input.color(color.new(color.red,   80), "Bearish correction zone", group = grpCol)
+colNeutral = input.color(color.new(color.gray,  85), "Neutral / unclear zone",  group = grpCol)
+
+grpTF     = "Timeframe Cascade (D1 -> H4 -> H1 -> 15m)"
+biasTF     = input.timeframe("D",    "Top bias TF (Indication)",  group = grpTF)
+midTF      = input.timeframe("240",  "Mid TF (Correction map)",   group = grpTF)
+workTF     = input.timeframe("60",   "Working TF (Continuation)", group = grpTF)
+trigTF     = input.timeframe("15",   "Trigger TF (Entry timing)", group = grpTF)
+strictAlign= input.bool(true, "Require ALL four TFs to agree for entry signal", group = grpTF, tooltip = "If off, only working & trigger must agree (more signals, lower quality).")
+
+grpEntry  = "Entry / Risk"
+showSig    = input.bool(true,  "Plot Continuation entry arrows", group = grpEntry)
+useNYHrs   = input.bool(false, "Restrict signals to NY session (09:00–16:00 NY)", group = grpEntry)
+showSL     = input.bool(true,  "Plot SL / TP guide lines",       group = grpEntry)
+
+// ---------- SWING ENGINE ---------------------------------------------
+// Returns +1 = bullish structure (HH+HL), -1 = bearish (LH+LL), 0 = unclear
+f_bias(_tf) =>
+    [ph1, pl1] = request.security(syminfo.tickerid, _tf, [ta.pivothigh(swingLen, swingLen), ta.pivotlow(swingLen, swingLen)], lookahead = barmerge.lookahead_off)
+    var float lastH1 = na
+    var float prevH1 = na
+    var float lastL1 = na
+    var float prevL1 = na
+    if not na(ph1)
+        prevH1 := lastH1
+        lastH1 := ph1
+    if not na(pl1)
+        prevL1 := lastL1
+        lastL1 := pl1
+    // Flattened ternary — no line wraps
+    bullStruct = not na(lastH1) and not na(prevH1) and not na(lastL1) and not na(prevL1) and lastH1 > prevH1 and lastL1 > prevL1
+    bearStruct = not na(lastH1) and not na(prevH1) and not na(lastL1) and not na(prevL1) and lastH1 < prevH1 and lastL1 < prevL1
+    bias = bullStruct ? 1 : bearStruct ? -1 : 0
+    bias
+
+biasD1  = f_bias(biasTF)
+biasH4  = f_bias(midTF)
+biasH1  = f_bias(workTF)
+biasM15 = f_bias(trigTF)
+
+// ---------- CHART MARKING (Sci-style) --------------------------------
+// Detect pivots on the CHART timeframe and draw clean horizontal rays
+phChart = ta.pivothigh(swingLen, swingLen)
+plChart = ta.pivotlow (swingLen, swingLen)
+
+var line[]  hiLines  = array.new<line>()
+var line[]  loLines  = array.new<line>()
+var label[] hiLabels = array.new<label>()
+var label[] loLabels = array.new<label>()
+
+// helper: trim oldest entries to keep chart clean
+f_trim(arr, lblArr, maxN) =>
+    while array.size(arr) > maxN
+        line.delete(array.shift(arr))
+        if array.size(lblArr) > 0
+            label.delete(array.shift(lblArr))
+
+// track previous swing values for HH/LH & HL/LL tagging
+var float prevHi = na
+var float prevLo = na
+
+if not na(phChart)
+    px = high[swingLen]
+    ln = line.new(bar_index[swingLen], px, bar_index, px, color = colHigh, width = 2, extend = extend.right, style = line.style_solid)
+    array.push(hiLines, ln)
+    if showLabels
+        tag = na(prevHi) ? "H" : (px > prevHi ? "HH" : "LH")
+        lb = label.new(bar_index[swingLen], px, tag, style = label.style_label_down, color = colHigh, textcolor = color.white, size = size.tiny)
+        array.push(hiLabels, lb)
+        prevHi := px
+    f_trim(hiLines, hiLabels, maxSwings)
+
+if not na(plChart)
+    px = low[swingLen]
+    ln = line.new(bar_index[swingLen], px, bar_index, px, color = colLow, width = 2, extend = extend.right, style = line.style_solid)
+    array.push(loLines, ln)
+    if showLabels
+        tag = na(prevLo) ? "L" : (px > prevLo ? "HL" : "LL")
+        lb = label.new(bar_index[swingLen], px, tag, style = label.style_label_up, color = colLow, textcolor = color.white, size = size.tiny)
+        array.push(loLabels, lb)
+        prevLo := px
+    f_trim(loLines, loLabels, maxSwings)
+
+// ---------- INDICATION / CORRECTION / CONTINUATION -------------------
+// Track most recent confirmed working-TF swings
+var float wkLastHi = na
+var float wkPrevHi = na
+var float wkLastLo = na
+var float wkPrevLo = na
+
+wkHi = request.security(syminfo.tickerid, workTF, ta.pivothigh(swingLen, swingLen), lookahead = barmerge.lookahead_off)
+wkLo = request.security(syminfo.tickerid, workTF, ta.pivotlow (swingLen, swingLen), lookahead = barmerge.lookahead_off)
+
+if not na(wkHi)
+    wkPrevHi := wkLastHi
+    wkLastHi := wkHi
+if not na(wkLo)
+    wkPrevLo := wkLastLo
+    wkLastLo := wkLo
+
+// Trigger-TF close (used for Continuation confirmation)
+trigClose = request.security(syminfo.tickerid, trigTF, close, lookahead = barmerge.lookahead_off)
+
+// Correlation gate — flattened, no line wraps
+strictBull = biasD1 ==  1 and biasH4 ==  1 and biasH1 ==  1 and biasM15 ==  1
+looseBull  = biasH1 ==  1 and biasM15 ==  1
+strictBear = biasD1 == -1 and biasH4 == -1 and biasH1 == -1 and biasM15 == -1
+looseBear  = biasH1 == -1 and biasM15 == -1
+
+fullAlignBull = strictAlign ? strictBull : looseBull
+fullAlignBear = strictAlign ? strictBear : looseBear
+
+// Continuation triggers: trigger-TF closes through last counter-swing
+buyContinuation  = fullAlignBull and not na(wkLastHi) and trigClose > wkLastHi
+sellContinuation = fullAlignBear and not na(wkLastLo) and trigClose < wkLastLo
+
+// Optional NY session filter — single-line boolean, no wrap
+nyHour       = hour(time, "America/New_York")
+inNyWindow   = nyHour >= 9 and nyHour < 16
+nySession    = not useNYHrs or inNyWindow
+
+buyContinuation  := buyContinuation  and nySession
+sellContinuation := sellContinuation and nySession
+
+// Fire only on the bar where condition flips true
+buySig  = buyContinuation  and not buyContinuation[1]
+sellSig = sellContinuation and not sellContinuation[1]
+
+// ---------- CORRECTION ZONE BOX (auto, on chart TF) ------------------
+var box corrBox = na
+bias    = biasH1
+zoneCol = bias == 1 ? colBull : bias == -1 ? colBear : colNeutral
+
+if not na(phChart) or not na(plChart)
+    topPx = not na(wkLastHi) ? wkLastHi : high
+    botPx = not na(wkLastLo) ? wkLastLo : low
+    if not na(corrBox)
+        box.delete(corrBox)
+    corrBox := box.new(bar_index - 30, topPx, bar_index + 10, botPx, border_color = color.new(color.gray, 60), bgcolor = zoneCol, extend = extend.right)
+
+// ---------- ENTRY ARROWS + SL / TP -----------------------------------
+plotshape(showSig and buySig,  title = "BUY Continuation",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime, 0), size = size.small, text = "ICC^")
+plotshape(showSig and sellSig, title = "SELL Continuation", style = shape.triangledown, location = location.abovebar, color = color.new(color.red,  0), size = size.small, text = "ICCv")
+
+// Precompute SL/TP on single lines — safer than wrapping the ternaries
+buyTpFromPrev  = wkPrevHi + (wkLastHi - wkLastLo)
+buyTpFromLast  = wkLastHi + (wkLastHi - wkLastLo)
+sellTpFromPrev = wkPrevLo - (wkLastHi - wkLastLo)
+sellTpFromLast = wkLastLo - (wkLastHi - wkLastLo)
+
+if showSL and buySig
+    sl = wkLastLo
+    tp = not na(wkPrevHi) ? buyTpFromPrev : buyTpFromLast
+    line.new(bar_index, sl, bar_index + 20, sl, color = color.red,   style = line.style_dashed, width = 1)
+    line.new(bar_index, tp, bar_index + 20, tp, color = color.green, style = line.style_dashed, width = 1)
+
+if showSL and sellSig
+    sl = wkLastHi
+    tp = not na(wkPrevLo) ? sellTpFromPrev : sellTpFromLast
+    line.new(bar_index, sl, bar_index + 20, sl, color = color.red,   style = line.style_dashed, width = 1)
+    line.new(bar_index, tp, bar_index + 20, tp, color = color.green, style = line.style_dashed, width = 1)
+
+// ---------- DASHBOARD ------------------------------------------------
+var table dash = table.new(position.top_right, 2, 6, border_width = 1)
+
+f_biasTxt(b) =>
+    b == 1 ? "^ BULL" : b == -1 ? "v BEAR" : "- flat"
+
+f_biasCol(b) =>
+    bullCol = color.new(color.green, 70)
+    bearCol = color.new(color.red,   70)
+    flatCol = color.new(color.gray,  70)
+    b == 1 ? bullCol : b == -1 ? bearCol : flatCol
+
+if barstate.islast
+    table.cell(dash, 0, 0, "TF",   bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(dash, 1, 0, "Bias", bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(dash, 0, 1, biasTF, text_color = color.white)
+    table.cell(dash, 1, 1, f_biasTxt(biasD1),  bgcolor = f_biasCol(biasD1))
+    table.cell(dash, 0, 2, midTF,  text_color = color.white)
+    table.cell(dash, 1, 2, f_biasTxt(biasH4),  bgcolor = f_biasCol(biasH4))
+    table.cell(dash, 0, 3, workTF, text_color = color.white)
+    table.cell(dash, 1, 3, f_biasTxt(biasH1),  bgcolor = f_biasCol(biasH1))
+    table.cell(dash, 0, 4, trigTF, text_color = color.white)
+    table.cell(dash, 1, 4, f_biasTxt(biasM15), bgcolor = f_biasCol(biasM15))
+
+    // Flattened — no wrapped ternaries
+    alignedTxt = fullAlignBull ? "^ ALIGNED LONG" : fullAlignBear ? "v ALIGNED SHORT" : "x NOT ALIGNED"
+    alignedBg  = fullAlignBull ? color.new(color.green, 40) : fullAlignBear ? color.new(color.red, 40) : color.new(color.gray, 40)
+
+    table.cell(dash, 0, 5, "Cascade", text_color = color.white)
+    table.cell(dash, 1, 5, alignedTxt, bgcolor = alignedBg, text_color = color.white)
+
+// ---------- ALERTS ---------------------------------------------------
+alertcondition(buySig,  "ICC BUY Continuation",  '{"symbol":"{{ticker}}","tf":"{{interval}}","side":"BUY","price":{{close}},"strategy":"ICC-Sci"}')
+alertcondition(sellSig, "ICC SELL Continuation", '{"symbol":"{{ticker}}","tf":"{{interval}}","side":"SELL","price":{{close}},"strategy":"ICC-Sci"}')

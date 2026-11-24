@@ -1,0 +1,726 @@
+//@version=6
+// =====================================================================================
+// ICC_TradesBySci_v1.1.7_Indicator.pine
+//   Type    : INDICATOR (chart study, signals + alerts). NOT a strategy.
+//             Places no orders, sizes nothing, produces no backtest report.
+//   Model   : ICC = Indication -> Correction -> Continuation ("Trades by Sci" / Sci)
+//   Supersedes v1.1.6. Changelog at foot.
+//
+//   NOT COMPILED BY THE AUTHOR. No Pine compiler exists outside TradingView.
+//   Everything below is static reasoning against the v6 spec. You are the first
+//   real compile.
+//
+// -------------------------------------------------------------------------------------
+// ARCHITECTURE
+// -------------------------------------------------------------------------------------
+//   swH and swL have exactly ONE writer, and that writer is SUSPENDED for the whole
+//   duration of a live cycle. The structure is RECONCILED once, at cycleEnd, promoting
+//   BOTH extremes: the indication extreme becomes the swing in the trend direction,
+//   the correction extreme becomes the swing against it. Indications originate ONLY
+//   from state 0.
+//
+//   v1.1.5 buffered mid-cycle pivots for replay at cycleEnd. That buffer never fired
+//   in either of its two implementations, and the reason is structural, not a coding
+//   slip: at cycleEnd the trend-side swing has just been set to the cycle's extreme,
+//   so no pivot observed DURING the cycle can extend it, and the against-trend swing
+//   has just been set to the correction extreme, which is by construction the furthest
+//   counter-move in the cycle. The structure is fully reconstructible from the two
+//   cycle extremes alone. The buffer is deleted in v1.1.7 (X3).
+//
+//   Section order per bar is fixed and must not be reordered:
+//     A  pivot detection + equal-extreme memory   (read-only w.r.t. swH/swL)
+//     B  SINGLE SWING WRITER                      (applies only when st == 0)
+//     C  trend derivation with staleness decay
+//     D  indication                               (st == 0 only)
+//     E  state 1 -> 2, or abandon
+//     F  state 2 -> 3, or cycleEnd
+//     G  state 3 -> cycleEnd
+//     H  cycleEnd reconciliation - promote both extremes
+//
+// -------------------------------------------------------------------------------------
+// SOURCE FIDELITY - T-rules traced to the 13 transcripts.
+// [ENG] items are MINE, with no transcript basis. Every one is an input.
+// -------------------------------------------------------------------------------------
+//   T1  Mark up on 1H / 4H. Never build structure on 5m/15m.        [trading is simple]
+//   T2  Swing = price reaches a high/low then reverses off a reaction.[positioning psych]
+//   T3  Indication = break ABOVE a swing high or BELOW a swing low.  [indication]
+//   T4  An indication ALWAYS creates a new high or a new low.        [Continuation]
+//   T5  NEVER trade the indication. It is a breakout; it is information.[how to mark up]
+//   T6  No-Trade Zone = a high and a low with NO indication.         [how to mark up]
+//   T7  Correction happens AFTER the new high/low, and grabs liquidity.[liquidity and corr]
+//   T8  Corrections do NOT always return to the level.               [liquidity and corr]
+//   T9  Monitor the correction on the 15m. Entries on 15m / 5m.      [liquidity and corr]
+//   T10 The entry model is ICC NESTED INSIDE ICC on the entry TF.    [Continuation/Timeframes]
+//   T11 Continuation = the SECOND push through the SAME level.       [positioning psych]
+//   T12 Entry is where momentum initiated - the broken HTF level.    [Understand Entries]
+//   T13 Stop: buys UNDER the higher low, sells ABOVE the lower high. [positioning psych]
+//   T14 TP1 = where the indication ENDED (the new high / new low).   [Continuation]
+//   T15 Hold past TP1 on structure; soft TPs, partials, 1:3-1:4.     [identify reversals]
+//   T16 Alignment: 15m aligns to 1H, 1H aligns to 4H. Higher TF wins.[Timeframes]
+//   T17 Equal highs / equal lows = not trending = stand aside.       [Continuation]
+//   T18 Trade the volume: London / New York. Gold = NY, 9:30 bell.   [Timeframes]
+//   T19 Only look back 1-3 sessions / 3-4 days.                      [Continuation]
+//   T20 Body closes are "closed deals"; wicks are secondary - though he DOES
+//       mark a wick as resistance on a lower TF. Hence an input.     [decision making]
+//   T21 Do NOT wait for the candle close once confirmations are in.  [market structure entries]
+//   T22 Structure must CONTINUE. A break against you is the exit sign.[Continuation]
+//   T23 A continuation normally creates the NEXT indication.         [Continuation]
+//
+// -------------------------------------------------------------------------------------
+// TIMEFRAME CONTRACT (enforced; signals suppressed on breach)
+//   Chart TF must be STRICTLY LOWER than Markup TF, and Markup TF <= Bias TF.
+//
+// REPAINT CONTRACT
+//   confirmHTF = false (default, faithful to T21): markup state is read from the
+//     FORMING bar. Signals can appear and vanish intrabar. Historical arrows are
+//     NOT what you saw live. The dashboard says so in red.
+//   confirmHTF = true: a raw signal is latched and released on the markup-bar
+//     boundary, re-validated against mState[1]/mDir[1] - the last chart bar of the
+//     CLOSED markup bar. Setups that die before the close plot a grey x and raise
+//     their own alert.
+//   KNOWN TIMING QUIRK (X4, accepted): a trigger landing ON a rollover bar is held
+//     to the NEXT markup boundary, so it releases one markup bar later than a
+//     trigger that fired mid-bar. It is no longer destroyed, which was the v1.1.6
+//     defect, but release timing is not uniform across the markup bar.
+//   UNFIXABLE IN PINE: `var` state inside request.security mutates on every tick of
+//     the forming HTF bar and rolls back at its close. confirmHTF gates OUTPUT only.
+//   UNFIXABLE IN PINE: ta.pivot* confirms `pvt` bars late, so swings and therefore
+//     indications are structurally delayed.
+//
+// DISCLAIMER: Educational tooling. A mechanical approximation of a discretionary
+//             method. No performance claimed or implied.
+// =====================================================================================
+
+indicator("ICC - Indication / Correction / Continuation (Trades by Sci) v1.1.7",
+   shorttitle = "ICC v1.1.7", overlay = true,
+   max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000)
+
+// --------------------------------------------------------------- STRUCTURE (T1,T2,T20)
+const string gS = "1 - Markup / structure (higher timeframe only)"
+tfMarkup    = input.timeframe("60",  "Markup TF", group = gS, tooltip = "T1: 1H or 4H. Must be HIGHER than your chart TF.")
+tfBias      = input.timeframe("240", "Bias TF (must agree)", group = gS)
+pvtHTF      = input.int(3, "Markup swing strength", minval = 1, maxval = 20, group = gS)
+pvtLTF      = input.int(2, "Entry-TF swing strength", minval = 1, maxval = 20, group = gS)
+useBody     = input.bool(true, "Use body closes (T20)", group = gS, tooltip = "On = 'closed deals'. Off = wicks count, which Sci does allow on lower TFs.")
+eqTolPct    = input.float(0.03, "Equal high/low tolerance %  [ENG]", minval = 0.0, step = 0.01, group = gS)
+eqLookback  = input.int(60, "Equal-extreme memory, markup bars  [ENG]", minval = 1, maxval = 500, group = gS, tooltip = "T17 as a persistent property of recent structure. Counted in MARKUP bars - 60 on a 1H markup is ~2.5 days.")
+trendMaxAge = input.int(200, "Trend leg staleness, bars  [ENG]", minval = 10, maxval = 2000, group = gS, tooltip = "A leg older than this stops counting toward trendDir, so the trend decays instead of latching.")
+
+// --------------------------------------------------------------- ICC CYCLE (markup TF)
+const string gI = "2 - ICC cycle (markup TF)"
+corrTrigPct  = input.float(20.0, "Correction trigger: pullback % of leg  [ENG]", minval = 1.0, maxval = 90.0, step = 5.0, group = gI, tooltip = "T8: the correction need NOT reach the level.")
+invalPct     = input.float(50.0, "Invalidation: % of leg beyond level  [ENG]", minval = 10.0, maxval = 300.0, step = 10.0, group = gI, tooltip = "T22 gives no number. This is mine.")
+maxCycleBars = input.int(96, "Max cycle length, markup bars  [ENG]", minval = 12, maxval = 500, group = gI, tooltip = "T19: 3-4 days. 96 = 4 days of 1H bars.")
+legTimeout   = input.int(10, "Abandon indication after N bars with no leg  [ENG]", minval = 2, maxval = 200, group = gI)
+minLegAtr    = input.float(0.25, "Minimum indication leg, x ATR(14)  [ENG]", minval = 0.0, maxval = 5.0, step = 0.05, group = gI, tooltip = "A leg of ~0 collapses the invalidation band onto the level itself.")
+maxChasePct  = input.float(25.0, "Max entry chase: % of leg  [ENG]", minval = 1.0, maxval = 200.0, step = 5.0, group = gI, tooltip = "In the shallow-correction path corrRef is assigned from a pivot that confirmed pvt bars ago, so price may already be far beyond it. Beyond this distance the cycle is ABANDONED, not parked.")
+useMkTrend   = input.bool(true, "Markup trend must agree with signal (T16)", group = gI, tooltip = "Completes T16's 15m -> 1H -> 4H chain. NOTE: trend legs are frozen during a live cycle - see W4 in the changelog.")
+
+// --------------------------------------------------------------- ENTRY (T9,T10,T16,T21)
+const string gE = "3 - Entry model (nested ICC on chart TF)"
+useNested       = input.bool(true, "Require nested ICC on chart TF (T10)", group = gE)
+nestCorrTrigPct = input.float(25.0, "Nested correction trigger %  [ENG]", minval = 1.0, maxval = 90.0, step = 5.0, group = gE, tooltip = "A 20% pullback on a 5m leg is not the same animal as on a 1H leg.")
+nestInvalPct    = input.float(60.0, "Nested invalidation %  [ENG]", minval = 10.0, maxval = 300.0, step = 10.0, group = gE)
+nestCycleBars   = input.int(150, "Nested max cycle, chart bars  [ENG]", minval = 12, maxval = 2000, group = gE)
+nestMaxBars     = input.int(20, "Nested signal stays valid N chart bars  [ENG]", minval = 1, maxval = 200, group = gE)
+useBias         = input.bool(true,  "Require Bias TF agreement (T16)", group = gE)
+biasStrict      = input.bool(true,  "Bias must be an established trend", group = gE)
+confirmHTF      = input.bool(false, "Release only on markup-bar close", group = gE, tooltip = "OFF = faithful to T21 but repaints. ON = non-repainting. See REPAINT CONTRACT.")
+
+// --------------------------------------------------------------- SESSIONS (T18)
+const string gV = "4 - Volume windows"
+useSess = input.bool(true, "Signals in session only (T18)", group = gV)
+sessLDN = input.session("0300-1130:23456", "London window", group = gV)
+sessNY  = input.session("0930-1600:23456", "New York window", group = gV, tooltip = "Gold: NY, 9:30 bell. Day mask excludes Sun/Sat.")
+sessTZ  = input.string("America/New_York", "Session timezone", options = ["America/New_York", "Europe/London", "UTC"], group = gV)
+
+// --------------------------------------------------------------- RISK (T12,T13,T14,T15)
+const string gR = "5 - Risk frame (display only)"
+slBufPct = input.float(0.05, "Stop buffer beyond swing %", minval = 0.0, step = 0.01, group = gR)
+minR     = input.float(1.5,  "Minimum R to TP1  [ENG]", minval = 0.0, step = 0.5, group = gR)
+rrRunner = input.float(4.0,  "Runner R multiple (soft TP2)  [ENG]", minval = 1.0, step = 0.5, group = gR, tooltip = "T15: soft TPs, partials, 1:3-1:4. Discretionary in the transcripts.")
+
+// --------------------------------------------------------------- DISPLAY
+const string gD = "6 - Display"
+showLevels  = input.bool(true, "HTF swing levels", group = gD)
+showNTZ     = input.bool(true, "No-Trade Zone (T6)", group = gD)
+showStages  = input.bool(true, "IND / CORR labels", group = gD)
+showRisk    = input.bool(true, "Entry / SL / TP", group = gD)
+showDropped = input.bool(true, "Mark dropped setups", group = gD)
+colBull     = input.color(#26a69a, "Bull", inline = "c", group = gD)
+colBear     = input.color(#ef5350, "Bear", inline = "c", group = gD)
+colNeut     = input.color(#787b86, "Neutral", inline = "c", group = gD)
+
+// =====================================================================================
+// THE STATE MACHINE
+//   0 NO-TRADE ZONE : a high and a low, no indication.                      (T6)
+//   1 INDICATION    : a swing broke; a new high/low is printing. Never traded.(T3,T4,T5)
+//   2 CORRECTION    : price pulled off the extreme, grabbing liquidity.     (T7,T8)
+//   3 CONTINUATION  : second push through the reference level = entry.      (T11)
+// =====================================================================================
+icc(simple int pvt, float eqTol, int eqMem, int trendAge, float corrTrig, float inval,
+     int maxCyc, int legTmo, float minLegX, float chaseMax) =>
+
+    // ---- unconditional series calls (Pine requires these on every bar) ---------------
+    float srcH = useBody ? math.max(open, close) : high
+    float srcL = useBody ? math.min(open, close) : low
+    float up   = useBody ? close : high
+    float dn   = useBody ? close : low
+    float atr  = ta.atr(14)
+    float ph   = ta.pivothigh(srcH, pvt, pvt)
+    float pl   = ta.pivotlow(srcL,  pvt, pvt)
+
+    // ---- structure (written ONLY by section B and section H) -------------------------
+    var float swH     = na
+    var float swL     = na
+    var int   legH    = 0        // +1 higher high, -1 lower high, 0 unknown
+    var int   legL    = 0        // +1 higher low,  -1 lower low,  0 unknown
+    var int   legHBar = 0
+    var int   legLBar = 0
+    var int   eqBar   = -1000000 // last bar an equal extreme was observed
+
+    // ---- cycle -----------------------------------------------------------------------
+    var int   st         = 0
+    var int   dir        = 0
+    var float lvl        = na    // the broken level                          (T12)
+    var float ext        = na    // the extreme the indication created        (T4,T14)
+    var float corrExt    = na    // higher low / lower high of the correction (T13)
+    var float corrRef    = na    // confirmed counter-swing inside the correction
+    var bool  breached   = false // did the correction reach back to lvl?     (T8)
+    var int   cyc        = 0
+    var int   indBar     = 0
+    var int   legBar     = 0     // bar the leg first cleared minLeg
+    var int   sig        = 0
+    // X1: the entry reference captured AT signal time, HELD for the whole of state 3.
+    // In confirmHTF mode the risk frame reads mEntRef[1], several bars after the
+    // signal fired, so a one-bar value is invisible there and the code fell through
+    // to the stale corrRef - exactly what the v1.1.6 W2 fix was meant to eliminate.
+    var float sigEntHold = na
+
+    sig := 0
+    bool moved    = false        // [ENG] one state transition per bar
+    bool cycleEnd = false
+    int  endDir   = 0
+
+    // ATR is na during warm-up. Treat an unavailable ATR as "no leg qualifies yet"
+    // rather than as "every leg qualifies".
+    bool  atrReady = not na(atr)
+    float minLeg   = atrReady ? atr * minLegX : na
+
+    // =================================================================================
+    // A. PIVOT DETECTION + EQUAL-EXTREME MEMORY (T2, T17)
+    // =================================================================================
+    bool eqHitH = not na(ph) and not na(swH) and math.abs(ph - swH) <= math.abs(swH) * eqTol / 100.0
+    bool eqHitL = not na(pl) and not na(swL) and math.abs(pl - swL) <= math.abs(swL) * eqTol / 100.0
+    if eqHitH or eqHitL
+        eqBar := bar_index
+    bool eqRecent = (bar_index - eqBar) <= eqMem
+
+    // =================================================================================
+    // B. THE SINGLE SWING WRITER
+    //    Applies ONLY when no cycle is live. X3: mid-cycle pivots are now simply
+    //    ignored rather than buffered - see the ARCHITECTURE note. The structure is
+    //    reconstructed from the cycle extremes in section H.
+    // =================================================================================
+    if st == 0
+        if not na(ph) and not eqHitH
+            legH    := na(swH) ? 0 : (ph > swH ? 1 : -1)
+            legHBar := bar_index
+            swH     := ph
+        if not na(pl) and not eqHitL
+            legL    := na(swL) ? 0 : (pl > swL ? 1 : -1)
+            legLBar := bar_index
+            swL     := pl
+
+    // =================================================================================
+    // C. TREND, WITH DECAY
+    //    Both legs must agree AND both must be recent. One higher high is not an
+    //    uptrend, and a higher high from 300 bars ago is not evidence.
+    // =================================================================================
+    bool legsFresh = (bar_index - legHBar) <= trendAge and (bar_index - legLBar) <= trendAge
+    int  trendDir  = not legsFresh ? 0 : legH == 1 and legL == 1 ? 1 : legH == -1 and legL == -1 ? -1 : 0
+
+    if st != 0
+        cyc += 1
+
+    // =================================================================================
+    // D. INDICATION (T3, T4, T5) - state 0 only
+    // =================================================================================
+    if not moved and st == 0 and not na(swH) and not na(swL)
+        if up > swH
+            dir      := 1
+            lvl      := swH
+            ext      := high
+            corrExt  := na
+            corrRef  := na
+            breached := false
+            cyc      := 0
+            indBar   := bar_index
+            legBar   := 0
+            st       := 1
+            moved    := true
+        else if dn < swL
+            dir      := -1
+            lvl      := swL
+            ext      := low
+            corrExt  := na
+            corrRef  := na
+            breached := false
+            cyc      := 0
+            indBar   := bar_index
+            legBar   := 0
+            st       := 1
+            moved    := true
+
+    // =================================================================================
+    // E. STATE 1 - the leg extends, then the correction begins (T7, T8)
+    // =================================================================================
+    if st == 1
+        ext := dir == 1 ? math.max(ext, high) : math.min(ext, low)
+        float leg1  = math.abs(ext - lvl)
+        float pull1 = dir == 1 ? ext - low : high - ext
+        // the indication bar's own range must not stamp legBar, or the leg timeout
+        // below becomes unreachable and a stalled cycle burns the full maxCyc budget
+        if bar_index > indBar and atrReady and leg1 > minLeg and legBar == 0
+            legBar := bar_index
+        if not moved and bar_index > indBar and atrReady and leg1 > minLeg and pull1 >= leg1 * corrTrig / 100.0
+            corrExt  := dir == 1 ? low : high
+            corrRef  := na                       // only a CONFIRMED pivot may set this
+            breached := dir == 1 ? dn < lvl : up > lvl
+            st       := 2
+            moved    := true
+        // an indication that never produces a leg is abandoned quickly
+        if not moved and legBar == 0 and (bar_index - indBar) >= legTmo
+            cycleEnd := true
+            endDir   := dir
+            moved    := true
+        if not moved and cyc > maxCyc
+            cycleEnd := true
+            endDir   := dir
+            moved    := true
+
+    // =================================================================================
+    // F. STATE 2 - correction resolves to continuation, or dies (T11, T13, T22)
+    // =================================================================================
+    if st == 2 and not moved
+        // ext MUST keep extending here: in the shallow path cRef is na until a pivot
+        // confirms, and price can run well past the old extreme meanwhile.
+        ext     := dir == 1 ? math.max(ext, high) : math.min(ext, low)
+        corrExt := dir == 1 ? math.min(corrExt, low) : math.max(corrExt, high)
+
+        if dir == 1 and dn < lvl
+            breached := true
+        if dir == -1 and up > lvl
+            breached := true
+        if dir == 1 and not na(ph)
+            corrRef := ph
+        if dir == -1 and not na(pl)
+            corrRef := pl
+
+        float leg2 = atrReady ? math.max(math.abs(ext - lvl), minLeg) : math.abs(ext - lvl)
+        // T11: if the correction reached the level, the level IS the trigger.
+        // T8 : if it never got there, the correction's own counter-swing is.
+        float cRef = breached ? lvl : corrRef
+        bool  push = na(cRef) ? false : (dir == 1 ? up > cRef : dn < cRef)
+        bool  dead = dir == 1 ? dn < lvl - leg2 * inval / 100.0 : up > lvl + leg2 * inval / 100.0
+
+        // corrRef is assigned from a pivot that confirmed pvt bars earlier, so price
+        // may already have run far beyond it. Entering there misprices the entry and
+        // inflates reported R on both ends. Uses up/dn so it honours useBody, rather
+        // than raw close as in v1.1.6.
+        float pushRef = dir == 1 ? up : dn
+        bool  chased  = na(cRef) or leg2 <= 0 ? false : math.abs(pushRef - cRef) > leg2 * chaseMax / 100.0
+
+        if dead or cyc > maxCyc                  // invalidation is evaluated FIRST
+            cycleEnd := true
+            endDir   := dir
+            moved    := true
+        else if push and chased
+            // X2: a chased trigger ABANDONS the cycle. In v1.1.6 this branch did
+            // nothing, so push and chased both stayed true on every subsequent bar
+            // while `dead` required a hard reversal that was not occurring - the
+            // machine sat in state 2 for the full maxCyc budget (four days on a 1H
+            // markup) and section D, gated on st == 0, could start nothing.
+            cycleEnd := true
+            endDir   := dir
+            moved    := true
+        else if push
+            st         := 3
+            sig        := dir
+            sigEntHold := cRef                   // X1: held for the whole of state 3
+            moved      := true
+
+    // =================================================================================
+    // G. STATE 3 - the continuation runs until structure breaks (T22, T23)
+    // =================================================================================
+    if st == 3 and not moved
+        ext := dir == 1 ? math.max(ext, high) : math.min(ext, low)
+        if (dir == 1 and dn < corrExt) or (dir == -1 and up > corrExt) or cyc > maxCyc
+            cycleEnd := true
+            endDir   := dir
+
+    // =================================================================================
+    // H. CYCLE END - the single reconciliation point
+    //    T4: the indication created a new high/low, so that extreme IS the swing.
+    //    T2/T13: the correction extreme is the higher low / lower high, so it is the
+    //    swing on the other side. Both are promoted UNCONDITIONALLY - a correction
+    //    that undercuts the prior swing is still the market's live structure, and
+    //    refusing to record it strands the leg timestamp until legsFresh expires.
+    // =================================================================================
+    if cycleEnd
+        if endDir == 1
+            if not na(ext)
+                legH    := na(swH) or ext > swH ? 1 : -1
+                legHBar := bar_index
+                swH     := ext
+            if not na(corrExt)
+                legL    := na(swL) or corrExt > swL ? 1 : -1
+                legLBar := bar_index
+                swL     := corrExt
+        else if endDir == -1
+            if not na(ext)
+                legL    := na(swL) or ext < swL ? -1 : 1
+                legLBar := bar_index
+                swL     := ext
+            if not na(corrExt)
+                legH    := na(swH) or corrExt < swH ? -1 : 1
+                legHBar := bar_index
+                swH     := corrExt
+        st         := 0
+        dir        := 0
+        sigEntHold := na
+
+    // X1: entRef survives the whole of state 3, so confirmHTF's mEntRef[1] read
+    // returns the captured reference rather than falling through to a stale corrRef.
+    float entRef = st == 3 or sig != 0 ? sigEntHold : na
+
+    [swH, swL, trendDir, st, dir, lvl, ext, corrExt, entRef, sig, eqRecent, breached]
+
+// -------------------------------------------------------------------------------------
+// Bias TF needs one integer, not a whole machine.
+// -------------------------------------------------------------------------------------
+iccTrend(simple int pvt, float eqTol, int trendAge) =>
+    float srcH = useBody ? math.max(open, close) : high
+    float srcL = useBody ? math.min(open, close) : low
+    float ph = ta.pivothigh(srcH, pvt, pvt)
+    float pl = ta.pivotlow(srcL,  pvt, pvt)
+    var float swH     = na
+    var float swL     = na
+    var int   legH    = 0
+    var int   legL    = 0
+    var int   legHBar = 0
+    var int   legLBar = 0
+    if not na(ph) and (na(swH) or math.abs(ph - swH) > math.abs(swH) * eqTol / 100.0)
+        legH    := na(swH) ? 0 : (ph > swH ? 1 : -1)
+        legHBar := bar_index
+        swH     := ph
+    if not na(pl) and (na(swL) or math.abs(pl - swL) > math.abs(swL) * eqTol / 100.0)
+        legL    := na(swL) ? 0 : (pl > swL ? 1 : -1)
+        legLBar := bar_index
+        swL     := pl
+    bool fresh = (bar_index - legHBar) <= trendAge and (bar_index - legLBar) <= trendAge
+    not fresh ? 0 : legH == 1 and legL == 1 ? 1 : legH == -1 and legL == -1 ? -1 : 0
+
+// =====================================================================================
+// TIMEFRAME CONTRACT
+// =====================================================================================
+int    secChart  = timeframe.in_seconds()
+int    secMarkup = timeframe.in_seconds(tfMarkup)
+int    secBias   = timeframe.in_seconds(tfBias)
+bool   tfFault   = secChart >= secMarkup or secMarkup > secBias
+string tfMsg     = secChart >= secMarkup ? "Chart TF must be LOWER than Markup TF" : secMarkup > secBias ? "Markup TF must be <= Bias TF" : ""
+
+// =====================================================================================
+// MARKUP TF, BIAS TF, NESTED ENTRY TF (T1, T10, T16)
+// =====================================================================================
+[mSwH, mSwL, mTrend, mState, mDir, mLvl, mExt, mCorr, mEntRef, mSig, mEq, mBreached] =
+   request.security(syminfo.tickerid, tfMarkup,
+   icc(pvtHTF, eqTolPct, eqLookback, trendMaxAge, corrTrigPct, invalPct, maxCycleBars, legTimeout, minLegAtr, maxChasePct),
+   lookahead = barmerge.lookahead_off)
+
+bTrend = request.security(syminfo.tickerid, tfBias, iccTrend(pvtHTF, eqTolPct, trendMaxAge), lookahead = barmerge.lookahead_off)
+
+// T10: ICC inside ICC. The entry TF is the chart you are on - 15m or 5m.
+// ACCEPTED, NOT FIXED: ten of these twelve are unused and Pine will warn on each.
+// Splitting out a two-field variant would duplicate a ~150-line state machine and
+// create two definitions of "what ICC means" that will drift under maintenance.
+[lSwH, lSwL, lTrend, lState, lDir, lLvl, lExt, lCorr, lEntRef, lSig, lEq, lBreached] =
+   icc(pvtLTF, eqTolPct, eqLookback, trendMaxAge, nestCorrTrigPct, nestInvalPct, nestCycleBars, legTimeout, minLegAtr, maxChasePct)
+
+// markup-bar boundary for the release latch, guarded on bar one
+mkTime = request.security(syminfo.tickerid, tfMarkup, time, lookahead = barmerge.lookahead_off)
+bool mkClosed = na(mkTime) or na(mkTime[1]) ? false : mkTime != mkTime[1]
+
+// =====================================================================================
+// GATES
+// =====================================================================================
+bool inLDN  = not na(time(timeframe.period, sessLDN, sessTZ))
+bool inNY   = not na(time(timeframe.period, sessNY,  sessTZ))
+bool sessOK = not useSess or inLDN or inNY                                    // T18
+
+bool biasLongOK  = not useBias or (biasStrict ? bTrend ==  1 : bTrend >=  0)  // T16
+bool biasShortOK = not useBias or (biasStrict ? bTrend == -1 : bTrend <=  0)
+
+bool mkLongOK  = not useMkTrend or mTrend >=  0
+bool mkShortOK = not useMkTrend or mTrend <=  0
+
+// the nested continuation is an EVENT, and it goes stale
+bool lFireLong  = lState == 3 and lDir ==  1 and not (lState[1] == 3 and lDir[1] ==  1)
+bool lFireShort = lState == 3 and lDir == -1 and not (lState[1] == 3 and lDir[1] == -1)
+var int lRecent  = 0
+var int lRecentB = 0
+if lFireLong
+    lRecent  := 1
+    lRecentB := bar_index
+if lFireShort
+    lRecent  := -1
+    lRecentB := bar_index
+bool lFresh    = lRecent != 0 and (bar_index - lRecentB) <= nestMaxBars
+bool nestLong  = not useNested or (lFresh and lRecent ==  1)                  // T10
+bool nestShort = not useNested or (lFresh and lRecent == -1)
+
+bool eqBlock = mEq                                                            // T17
+
+// one shot per markup continuation, not once per chart bar
+bool rawLong  = mSig ==  1 and mSig[1] !=  1
+bool rawShort = mSig == -1 and mSig[1] != -1
+
+// ---- release latch (REPAINT CONTRACT) -----------------------------------------------
+// Capture the pending state carried in from the PREVIOUS bar before this bar can set
+// it, so a raw signal landing on a rollover bar cannot self-release. Re-validate
+// against mState[1]/mDir[1] - the last chart bar of the CLOSED markup bar.
+var bool pendLong  = false
+var bool pendShort = false
+bool pendLongPrev  = pendLong
+bool pendShortPrev = pendShort
+
+if rawLong
+    pendLong := true
+if rawShort
+    pendShort := true
+
+bool relLong  = pendLongPrev  and mkClosed and mState[1] == 3 and mDir[1] ==  1
+bool relShort = pendShortPrev and mkClosed and mState[1] == 3 and mDir[1] == -1
+
+// only meaningful in confirmed mode, else every normal signal raises a phantom drop
+bool dropLong  = confirmHTF and pendLongPrev  and mkClosed and not relLong
+bool dropShort = confirmHTF and pendShortPrev and mkClosed and not relShort
+
+// clear only what was NOT set on this bar, or a trigger landing on a rollover bar is
+// set and wiped in the same bar and neither relLong nor dropLong can ever see it
+if mkClosed
+    if not rawLong
+        pendLong := false
+    if not rawShort
+        pendShort := false
+
+bool fireLong  = confirmHTF ? relLong  : rawLong
+bool fireShort = confirmHTF ? relShort : rawShort
+
+// ---- risk frame, fully validated before anything is drawn ---------------------------
+float entryPrice = confirmHTF ? mEntRef[1] : mEntRef
+float refCorr    = confirmHTF ? mCorr[1]   : mCorr
+float refExt     = confirmHTF ? mExt[1]    : mExt
+float slPrice = na
+float tp1     = na
+float tp2     = na
+float rMult   = na
+bool  valid   = false
+
+if fireLong and not na(entryPrice) and not na(refCorr) and not na(refExt)
+    slPrice := refCorr - math.abs(refCorr) * slBufPct / 100.0                 // T13
+    tp1     := refExt                                                         // T14
+    float riskL = entryPrice - slPrice
+    rMult   := riskL > 0 ? (tp1 - entryPrice) / riskL : na
+    tp2     := entryPrice + riskL * rrRunner                                  // T15
+    valid   := riskL > 0 and tp1 > entryPrice and not na(rMult) and rMult >= minR
+
+if fireShort and not na(entryPrice) and not na(refCorr) and not na(refExt)
+    slPrice := refCorr + math.abs(refCorr) * slBufPct / 100.0                 // T13
+    tp1     := refExt                                                         // T14
+    float riskS = slPrice - entryPrice
+    rMult   := riskS > 0 ? (entryPrice - tp1) / riskS : na
+    tp2     := entryPrice - riskS * rrRunner                                  // T15
+    valid   := riskS > 0 and tp1 < entryPrice and not na(rMult) and rMult >= minR
+
+bool contLong  = fireLong  and valid and sessOK and biasLongOK  and mkLongOK  and nestLong  and not eqBlock and not tfFault
+bool contShort = fireShort and valid and sessOK and biasShortOK and mkShortOK and nestShort and not eqBlock and not tfFault
+
+// =====================================================================================
+// PLOTS
+// =====================================================================================
+plot(showLevels ? mSwH : na, "Swing High (sellers)", color = color.new(colBear, 20), style = plot.style_linebr, linewidth = 2)
+plot(showLevels ? mSwL : na, "Swing Low (buyers)",   color = color.new(colBull, 20), style = plot.style_linebr, linewidth = 2)
+plot(showLevels and mState > 0 ? mLvl : na, "ICC Reaction Level", color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 2)
+
+// T6 - No-Trade Zone
+bool ntz = mState == 0 and not na(mSwH) and not na(mSwL) and mSwH > mSwL
+var box ntzBox = na
+if showNTZ and ntz
+    if na(ntzBox)
+        ntzBox := box.new(bar_index, mSwH, bar_index + 1, mSwL, border_color = colNeut, bgcolor = color.new(colNeut, 92))
+    else
+        box.set_right(ntzBox, bar_index + 1)
+        box.set_top(ntzBox, mSwH)
+        box.set_bottom(ntzBox, mSwL)
+else if not na(ntzBox)
+    box.delete(ntzBox)
+    ntzBox := na
+bgcolor(showNTZ and ntz ? color.new(colNeut, 90) : na, title = "No-Trade Zone")
+
+// stage labels - the indication is LABELLED, never signalled (T5)
+bool newInd  = mState == 1 and mState[1] != 1
+bool newCorr = mState == 2 and mState[1] != 2
+if showStages and newInd
+    label.new(bar_index, mDir == 1 ? high : low, "IND - do not trade",
+       yloc      = mDir == 1 ? yloc.abovebar : yloc.belowbar,
+       style     = mDir == 1 ? label.style_label_down : label.style_label_up,
+       color     = color.new(color.orange, 15), textcolor = color.white, size = size.tiny)
+if showStages and newCorr
+    label.new(bar_index, mDir == 1 ? low : high, "CORR - liquidity",
+       yloc      = mDir == 1 ? yloc.belowbar : yloc.abovebar,
+       style     = mDir == 1 ? label.style_label_up : label.style_label_down,
+       color     = color.new(color.gray, 15), textcolor = color.white, size = size.tiny)
+
+plotshape(contLong,  "CONT Long",  style = shape.triangleup,   location = location.belowbar, color = colBull, size = size.small, text = "CONT")
+plotshape(contShort, "CONT Short", style = shape.triangledown, location = location.abovebar, color = colBear, size = size.small, text = "CONT")
+plotshape(showDropped and dropLong,  "Dropped Long",  style = shape.xcross, location = location.belowbar, color = color.new(colNeut, 30), size = size.tiny)
+plotshape(showDropped and dropShort, "Dropped Short", style = shape.xcross, location = location.abovebar, color = color.new(colNeut, 30), size = size.tiny)
+
+// ---- risk frame, previous drawings deleted on every new signal -----------------------
+var line  lnE = na
+var line  lnS = na
+var line  ln1 = na
+var line  ln2 = na
+var label lbE = na
+var label lbS = na
+var label lb1 = na
+var label lb2 = na
+
+if showRisk and (contLong or contShort)
+    line.delete(lnE)
+    line.delete(lnS)
+    line.delete(ln1)
+    line.delete(ln2)
+    label.delete(lbE)
+    label.delete(lbS)
+    label.delete(lb1)
+    label.delete(lb2)
+    color cDir = contLong ? colBull : colBear
+    lnE := line.new(bar_index, entryPrice, bar_index + 30, entryPrice, color = cDir, width = 2)
+    lnS := line.new(bar_index, slPrice,    bar_index + 30, slPrice,    color = color.red,  width = 1, style = line.style_dashed)
+    ln1 := line.new(bar_index, tp1,        bar_index + 30, tp1,        color = color.teal, width = 1, style = line.style_dotted)
+    ln2 := line.new(bar_index, tp2,        bar_index + 30, tp2,        color = color.new(color.teal, 40), width = 1, style = line.style_dotted)
+    lbE := label.new(bar_index + 30, entryPrice, "Entry " + str.tostring(entryPrice, format.mintick), style = label.style_label_left, color = color.new(cDir, 20), textcolor = color.white, size = size.tiny)
+    lbS := label.new(bar_index + 30, slPrice,    "SL "    + str.tostring(slPrice,    format.mintick), style = label.style_label_left, color = color.new(color.red, 20), textcolor = color.white, size = size.tiny)
+    lb1 := label.new(bar_index + 30, tp1,        "TP1 "   + str.tostring(tp1, format.mintick) + "  (" + str.tostring(rMult, "#.##") + "R)", style = label.style_label_left, color = color.new(color.teal, 20), textcolor = color.white, size = size.tiny)
+    lb2 := label.new(bar_index + 30, tp2,        "TP2 "   + str.tostring(tp2,        format.mintick), style = label.style_label_left, color = color.new(color.teal, 40), textcolor = color.white, size = size.tiny)
+
+// =====================================================================================
+// DASHBOARD
+// =====================================================================================
+var table dash = table.new(position.top_right, 2, 11, border_width = 1)
+if barstate.islast
+    string sState = mState == 0 ? "NO-TRADE ZONE" : mState == 1 ? "INDICATION" : mState == 2 ? "CORRECTION" : "CONTINUATION"
+    string sDir   = mDir   ==  1 ? "Bullish"  : mDir   == -1 ? "Bearish"   : "-"
+    string sBias  = bTrend ==  1 ? "Uptrend"  : bTrend == -1 ? "Downtrend" : "Undefined"
+    string sMk    = mTrend ==  1 ? "Uptrend"  : mTrend == -1 ? "Downtrend" : "Undefined"
+    string sNest  = not lFresh ? "-" : lRecent == 1 ? "Bullish continuation" : lRecent == -1 ? "Bearish continuation" : "-"
+    string sSess  = inNY ? "New York" : inLDN ? "London" : "Out of session"
+    string sCorr  = mState >= 2 ? (mBreached ? "Yes - at level" : "No - shallow") : "-"
+    string sLvl   = mState > 0 ? str.tostring(mLvl, format.mintick) + (confirmHTF ? "" : " (live)") : "-"
+    color  cState = mState == 3 ? color.teal : mState == 0 ? color.gray : color.orange
+    table.cell(dash, 0, 0, "ICC " + tfMarkup, bgcolor = color.new(color.black, 20), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, sState, bgcolor = color.new(cState, 20), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 1, "Direction", text_size = size.tiny)
+    table.cell(dash, 1, 1, sDir, text_size = size.tiny)
+    table.cell(dash, 0, 2, "Bias " + tfBias, text_size = size.tiny)
+    table.cell(dash, 1, 2, sBias, text_size = size.tiny)
+    table.cell(dash, 0, 3, "Markup trend", text_size = size.tiny)
+    table.cell(dash, 1, 3, sMk, text_size = size.tiny)
+    table.cell(dash, 0, 4, "Nested " + timeframe.period, text_size = size.tiny)
+    table.cell(dash, 1, 4, sNest, text_size = size.tiny)
+    table.cell(dash, 0, 5, "Session", text_size = size.tiny)
+    table.cell(dash, 1, 5, sSess, text_size = size.tiny)
+    table.cell(dash, 0, 6, "Equal H/L (T17)", text_size = size.tiny)
+    table.cell(dash, 1, 6, eqBlock ? "YES - stand aside" : "No", text_size = size.tiny)
+    table.cell(dash, 0, 7, "Corr reached level", text_size = size.tiny)
+    table.cell(dash, 1, 7, sCorr, text_size = size.tiny)
+    table.cell(dash, 0, 8, "Reaction level", text_size = size.tiny)
+    table.cell(dash, 1, 8, sLvl, text_size = size.tiny)
+    table.cell(dash, 0, 9, "Repaint mode", text_size = size.tiny)
+    table.cell(dash, 1, 9, confirmHTF ? "Confirmed" : "LIVE - repaints", bgcolor = color.new(confirmHTF ? color.green : color.maroon, 60), text_size = size.tiny)
+    table.cell(dash, 0, 10, "TF contract", text_size = size.tiny)
+    table.cell(dash, 1, 10, tfFault ? "FAULT - " + tfMsg : "OK", bgcolor = color.new(tfFault ? color.red : color.green, 60), text_size = size.tiny)
+
+// =====================================================================================
+// ALERTS
+// =====================================================================================
+alertcondition(newInd,    "ICC - Indication",         "ICC: indication - new high/low printed. Information only, do not trade the breakout.")
+alertcondition(newCorr,   "ICC - Correction",         "ICC: correction underway - drop to the entry timeframe and track it.")
+alertcondition(contLong,  "ICC - Continuation LONG",  "ICC: continuation LONG - second push through the level, in session, timeframes aligned.")
+alertcondition(contShort, "ICC - Continuation SHORT", "ICC: continuation SHORT - second push through the level, in session, timeframes aligned.")
+alertcondition(dropLong or dropShort, "ICC - Setup dropped at confirmation", "ICC: a pending continuation did not survive to the markup-bar close.")
+
+// =====================================================================================
+// CHANGELOG
+//
+//   v1.1.7  X1, X2, X3. Architecture unchanged. Not compiled by the author.
+//
+//     X3 REMOVED THE PIVOT BUFFER, as requested. Deleted pendPh, pendPl, pendPhBar,
+//        pendPlBar, the `else` branch in section B, and the drain block in section H
+//        - about 20 lines and four state variables. The buffer never fired in either
+//        of its two implementations. v1.1.5 tested `pendPh > swH` immediately after
+//        swH had been promoted to the cycle maximum, which no mid-cycle pivot can
+//        exceed. v1.1.6 added `pendPhBar > legHBar - 1`, but legHBar had been set to
+//        bar_index three lines above, reducing the test to "confirmed on this exact
+//        bar". The failure is structural, not a coding slip: at cycleEnd the
+//        trend-side swing is the cycle extreme and the against-trend swing is the
+//        correction extreme, so the structure is fully reconstructible from those
+//        two values and a buffer has nothing to contribute. Mid-cycle pivots are now
+//        ignored outright, which is what the code already did in effect.
+//
+//     X1 HIGH - confirmHTF bypassed the v1.1.6 W2 entry capture. sigEnt was returned
+//        only on the bar where sig != 0, but the confirmed-mode risk frame reads
+//        mEntRef[1], several bars later, by which point sig == 0 and entRef fell
+//        through to the stale corrRef - the exact value W2 was built to eliminate.
+//        The fix worked in live mode only. Replaced with sigEntHold, a var latched
+//        at signal time, held for the whole of state 3, cleared at cycleEnd.
+//
+//     X2 HIGH - the chase guard could freeze the machine for the full cycle budget.
+//        `else if push and not chased` meant that when both were true NOTHING
+//        happened: no transition, no signal, no exit. Price stayed beyond cRef, so
+//        push and chased remained true on every later bar, while `dead` required a
+//        hard reversal that by definition was not occurring. The cycle sat in state
+//        2 until cyc > maxCyc - 96 markup bars, four days on a 1H chart - and
+//        section D, gated on st == 0, could start nothing. This was the V5
+//        chart-blocking failure reintroduced by v1.1.6's own W2 fix. A chased
+//        trigger now ABANDONS the cycle via cycleEnd.
+//
+//     LOW - `chased` now measures from up/dn rather than raw close, so it honours
+//        useBody like every other break test in the file.
+//
+//     X4 ACCEPTED, NOT FIXED - a trigger landing ON a rollover bar is held to the
+//        NEXT markup boundary, releasing one markup bar later than a mid-bar
+//        trigger, and converting to dropLong if the machine left state 3 meanwhile.
+//        No longer destroyed (the v1.1.6 W1 defect), but timing is not uniform.
+//        Documented in the REPAINT CONTRACT.
+//     W4 ACCEPTED, NOT FIXED - trend legs are frozen while a cycle is live, because
+//        section B is suspended, so mkLongOK evaluates structure as it stood before
+//        the indication. Arguably correct for T16 - you assess alignment when the
+//        setup forms - but it is a real quirk and the tooltip says so.
+//     A6 ACCEPTED, NOT FIXED - ten unused values in the nested destructure.
+//
+//     CARRIED FORWARD: C1-C3, L1-L5, B1-B8, A1-A5, A7, A8, V1-V9, W1-W3, W5, W6.
+//
+//     STILL UNFIXABLE IN PINE
+//       R3  `var` state inside request.security mutates across ticks of the forming
+//           HTF bar and rolls back at its close. confirmHTF gates output only.
+//       R4  ta.pivot* confirms `pvt` bars late, so swings and indications lag.
+//
+//     STILL MINE, NOT SCI'S
+//       corrTrigPct, invalPct, maxCycleBars, legTimeout, minLegAtr, maxChasePct,
+//       eqTolPct, eqLookback, trendMaxAge, pivot lengths, the one-transition-per-bar
+//       latch, rrRunner, minR, nestMaxBars, nestCycleBars, nestCorrTrigPct,
+//       nestInvalPct.
+// =====================================================================================

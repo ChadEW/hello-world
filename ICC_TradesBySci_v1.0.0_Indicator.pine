@@ -1,0 +1,311 @@
+//@version=6
+// =====================================================================================
+// FILE IDENTITY
+//   Name     : ICC_TradesBySci_v1.0.0_Indicator.pine
+//   Type     : INDICATOR (chart study / signal + alert engine). NOT a strategy.
+//              It does not place, size, or manage orders and produces no backtest report.
+//   Model    : ICC = Indication -> Correction -> Continuation (as taught by "Trades by Sci")
+//   Sourced  : Coded explicitly from the attached transcripts:
+//              indication.txt, liquidity and correctios.txt, Continuation.txt,
+//              market structure.txt, market structure entries.txt, Timeframes.txt,
+//              how to mark up.txt, how to markup charts.txt, Understand Entries.txt,
+//              identify reversals.txt, positioning psych.txt, trading is simple.txt,
+//              decision making trading psch.txt
+//
+// TRANSCRIPT RULES ENCODED (rule -> code region)
+//   R1  Markup only on HTF (1H default, 4H confirm, daily optional)........ tfMarkup/tfBias
+//   R2  Swing = price reaches an extreme then reverses off a reaction...... ta.pivothigh/low
+//   R3  Body closes are "closed deals"; wicks are secondary................ useBodyClose
+//   R4  Indication = price BREAKS a swing high or swing low, and an
+//       indication ALWAYS creates a new high or a new low.................. STATE 1
+//   R5  NEVER trade the indication (breakout = FOMO/liquidity)............. no signal at STATE 1
+//   R6  Correction = pullback after the new high/low that grabs liquidity;
+//       monitor it on the LTF............................................... STATE 2
+//   R7  Continuation = SECOND push back through the SAME level that
+//       showed direction in the first place = the entry.................... STATE 3 -> signal
+//   R8  Entry is where momentum initiated (the broken HTF level)........... entryPrice
+//   R9  Stop: under the higher low (buys) / above the lower high (sells)... slPrice
+//   R10 Target: the opposing HTF swing (buys go to the sellers, sells go
+//       to the buyers); soft TPs, 1:3-1:4 runner........................... tp1/tp2
+//   R11 No-Trade Zone = a high and a low with NO indication................ ntzBox
+//   R12 Equal highs / equal lows = not trending = stand aside.............. eqTol
+//   R13 Alignment: 15m must agree with 1H, 1H must agree with 4H........... biasOK + ltfOK
+//   R14 Trade the volume: London / New York sessions only.................. sessOK
+//   R15 Trend must CONTINUE; structure break against you = exit sign....... invalidation
+//
+// DISCLAIMER: Educational tooling. Signals are mechanical approximations of a
+//             discretionary method. No performance is implied or guaranteed.
+// =====================================================================================
+
+indicator("ICC — Indication / Correction / Continuation (Trades by Sci)", shorttitle="ICC v1.0.0", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ------------------------------------------------------------------ INPUTS: STRUCTURE
+grpS = "1 · Structure & Markup (higher time frame only)"
+tfMarkup   = input.timeframe("60",  "Markup TF (swings / indication)", group=grpS, tooltip="Transcript: mark up on the 1H or 4H. Never build structure on the 5m/15m.")
+tfBias     = input.timeframe("240", "Bias TF (must align)",            group=grpS)
+pvtLen     = input.int(3, "Swing pivot strength (bars each side)", minval=1, maxval=20, group=grpS)
+useBodyClose = input.bool(true, "Use body closes for swings & breaks", group=grpS, tooltip="Transcript: 'I'm big on body closes — those are closed deals.' Wicks are noted, not traded.")
+eqTolPct   = input.float(0.03, "Equal-high / equal-low tolerance (%)", minval=0.0, step=0.01, group=grpS, tooltip="Within this band a new swing is treated as an EQUAL high/low = no trend = stand aside.")
+
+// ------------------------------------------------------------------ INPUTS: ENTRY
+grpE = "2 · Entry model (lower time frame confirmation)"
+useLTF     = input.bool(true, "Require LTF structure shift on chart TF", group=grpE, tooltip="Use the 15m or 5m chart. Longs need a close above the last chart-TF lower high; shorts need a close below the last chart-TF higher low.")
+ltfPvt     = input.int(2, "Chart-TF pivot strength", minval=1, maxval=10, group=grpE)
+useBias    = input.bool(true, "Require Bias TF alignment", group=grpE)
+allowCounter = input.bool(false, "Allow continuation against Bias TF", group=grpE, tooltip="Off = only trade with the higher time frame. The higher the TF, the more it is respected.")
+
+// ------------------------------------------------------------------ INPUTS: SESSIONS
+grpV = "3 · Volume windows (trade in session only)"
+useSess    = input.bool(true, "Restrict signals to session volume", group=grpV)
+sessLDN    = input.session("0300-1130", "London window", group=grpV)
+sessNY     = input.session("0930-1600", "New York window", group=grpV, tooltip="Transcript: gold is traded on the 1H during New York — 9:30 bell. Avoid 'fake volume' outside session.")
+sessTZ     = input.string("America/New_York", "Session time zone", options=["America/New_York","Europe/London","UTC"], group=grpV)
+
+// ------------------------------------------------------------------ INPUTS: RISK
+grpR = "4 · Risk framing (display only)"
+slBufPct   = input.float(0.05, "Stop buffer beyond the swing (%)", minval=0.0, step=0.01, group=grpR)
+rrRunner   = input.float(4.0, "Runner R multiple (soft TP2)", minval=1.0, step=0.5, group=grpR, tooltip="Transcript: first target is the opposing swing (~1:3); the runner is held for 1:4+ as the trend makes its next high/low.")
+
+// ------------------------------------------------------------------ INPUTS: VISUALS
+grpD = "5 · Display"
+showLevels = input.bool(true,  "HTF swing levels",   group=grpD)
+showNTZ    = input.bool(true,  "No-Trade Zone box",  group=grpD)
+showLabels = input.bool(true,  "IND / CORR / CONT labels", group=grpD)
+showRisk   = input.bool(true,  "Entry / Stop / Targets", group=grpD)
+colBull    = input.color(color.new(#26a69a, 0), "Bullish", inline="c", group=grpD)
+colBear    = input.color(color.new(#ef5350, 0), "Bearish", inline="c", group=grpD)
+colNeut    = input.color(color.new(#787b86, 70), "Neutral / NTZ", inline="c", group=grpD)
+
+// =====================================================================================
+// ICC STATE MACHINE  (runs on the markup TF via request.security)
+//   state 0 = NO-TRADE ZONE  : a high and a low, no indication. Do nothing.
+//   state 1 = INDICATION     : a swing high/low was broken and a NEW high/low printed.
+//                              Information only — never traded.
+//   state 2 = CORRECTION     : price returned back through the indication level,
+//                              grabbing the breakout traders' liquidity.
+//   state 3 = CONTINUATION   : price pushed back through that SAME level a second
+//                              time = the entry. Fires once, then re-arms.
+// =====================================================================================
+icc(int pvt, float eqTol) =>
+    float srcH = useBodyClose ? math.max(open, close) : high
+    float srcL = useBodyClose ? math.min(open, close) : low
+    float brk  = useBodyClose ? close : high      // break reference for bullish
+    float brkD = useBodyClose ? close : low       // break reference for bearish
+
+    float ph = ta.pivothigh(srcH, pvt, pvt)
+    float pl = ta.pivotlow(srcL,  pvt, pvt)
+
+    var float swH     = na      // current swing high (sellers are sitting here)
+    var float swL     = na      // current swing low  (buyers are sitting here)
+    var float prevH   = na      // previous swing high — the opposing target for sells
+    var float prevL   = na      // previous swing low  — the opposing target for buys
+    var int   struct  = 0       // +1 uptrend (HH/HL), -1 downtrend (LH/LL), 0 undefined
+    var bool  eqHigh  = false
+    var bool  eqLow   = false
+
+    var int   state   = 0
+    var int   dir     = 0       // direction of the live indication: +1 bull, -1 bear
+    var float lvl     = na      // the level that was broken = the entry reference (R8)
+    var float extreme = na      // the new high/low created by the indication (R4)
+    var float corrX   = na      // correction extreme = the higher low / lower high (R9)
+    var float tgt     = na      // opposing swing = first soft target (R10)
+    var int   sig     = 0       // +1 long continuation fired, -1 short continuation fired
+
+    sig := 0
+
+    // ---- 1. Swing tracking. A new swing high is only "new" if it clears the tolerance.
+    if not na(ph)
+        eqHigh := not na(swH) and math.abs(ph - swH) <= swH * eqTol / 100.0
+        if not eqHigh
+            prevH := swH
+            swH   := ph
+            struct := not na(prevH) and ph > prevH ? 1 : not na(prevH) and ph < prevH ? -1 : struct
+    if not na(pl)
+        eqLow := not na(swL) and math.abs(pl - swL) <= swL * eqTol / 100.0
+        if not eqLow
+            prevL := swL
+            swL   := pl
+            struct := not na(prevL) and pl > prevL ? 1 : not na(prevL) and pl < prevL ? -1 : struct
+
+    bool haveBoth = not na(swH) and not na(swL)
+
+    // ---- 2. INDICATION (R4/R5). Break of a swing high or a swing low. No trade taken.
+    if haveBoth and (state == 0 or state == 3)
+        if brk > swH
+            dir     := 1
+            lvl     := swH           // the level that just proved buyers are in control
+            extreme := high
+            tgt     := prevH         // buys are taken to where the next sellers sit
+            corrX   := na
+            state   := 1
+        else if brkD < swL
+            dir     := -1
+            lvl     := swL
+            extreme := low
+            tgt     := prevL         // sells are taken to where the next buyers sit
+            corrX   := na
+            state   := 1
+
+    // ---- 3. Indication leg keeps extending until price turns back (new high / new low)
+    if state == 1
+        extreme := dir == 1 ? math.max(extreme, high) : math.min(extreme, low)
+        // CORRECTION begins when price trades back through the broken level (R6)
+        bool backThrough = dir == 1 ? brkD < lvl : brk > lvl
+        if backThrough
+            corrX := dir == 1 ? low : high
+            state := 2
+
+    // ---- 4. CORRECTION: track the higher low / lower high that the pullback builds (R9)
+    if state == 2
+        corrX := dir == 1 ? math.min(corrX, low) : math.max(corrX, high)
+        // CONTINUATION: the SECOND push back through the same level = the entry (R7)
+        bool secondPush = dir == 1 ? brk > lvl : brkD < lvl
+        if secondPush
+            state := 3
+            sig   := dir
+        // INVALIDATION: the correction ate the whole indication leg — structure failed (R15)
+        if (dir == 1 and brkD < extreme - (extreme - lvl) * 2.0) or (dir == -1 and brk > extreme + (lvl - extreme) * 2.0)
+            state := 0
+            dir   := 0
+
+    // ---- 5. Re-arm: once in continuation, a fresh break of the opposite swing resets
+    if state == 3
+        if (dir == 1 and brkD < corrX) or (dir == -1 and brk > corrX)
+            state := 0
+            dir   := 0
+
+    [swH, swL, prevH, prevL, struct, state, dir, lvl, extreme, corrX, tgt, sig, eqHigh, eqLow]
+
+// =====================================================================================
+// PULL MARKUP-TF AND BIAS-TF STATE
+// =====================================================================================
+[mSwH, mSwL, mPrevH, mPrevL, mStruct, mState, mDir, mLvl, mExt, mCorr, mTgt, mSig, mEqH, mEqL] = request.security(syminfo.tickerid, tfMarkup, icc(pvtLen, eqTolPct), lookahead=barmerge.lookahead_off)
+
+[, , , , bStruct, bState, bDir, , , , , , , ] = request.security(syminfo.tickerid, tfBias, icc(pvtLen, eqTolPct), lookahead=barmerge.lookahead_off)
+
+// =====================================================================================
+// CHART-TF (LTF) STRUCTURE SHIFT — the 15m/5m must flip to agree (R13)
+// =====================================================================================
+float lSrcH = useBodyClose ? math.max(open, close) : high
+float lSrcL = useBodyClose ? math.min(open, close) : low
+float lph = ta.pivothigh(lSrcH, ltfPvt, ltfPvt)
+float lpl = ta.pivotlow(lSrcL,  ltfPvt, ltfPvt)
+var float ltfH = na
+var float ltfL = na
+if not na(lph)
+    ltfH := lph
+if not na(lpl)
+    ltfL := lpl
+float lBrk = useBodyClose ? close : high
+float lBrkD = useBodyClose ? close : low
+bool ltfBull = not na(ltfH) and lBrk  > ltfH     // broke the last lower high
+bool ltfBear = not na(ltfL) and lBrkD < ltfL     // broke the last higher low
+
+// =====================================================================================
+// SESSION / VOLUME WINDOW (R14)
+// =====================================================================================
+bool inLDN = not na(time(timeframe.period, sessLDN, sessTZ))
+bool inNY  = not na(time(timeframe.period, sessNY,  sessTZ))
+bool sessOK = not useSess or inLDN or inNY
+
+// =====================================================================================
+// SIGNALS
+// =====================================================================================
+bool biasLongOK  = not useBias or allowCounter or bStruct >= 0
+bool biasShortOK = not useBias or allowCounter or bStruct <= 0
+bool ltfLongOK   = not useLTF or ltfBull
+bool ltfShortOK  = not useLTF or ltfBear
+bool eqBlock     = mEqH or mEqL                    // equal highs/lows = not trending (R12)
+
+bool contLong  = mSig ==  1 and sessOK and biasLongOK  and ltfLongOK  and not eqBlock
+bool contShort = mSig == -1 and sessOK and biasShortOK and ltfShortOK and not eqBlock
+
+// Risk framing (display only) — entry at the level, stop beyond the correction swing (R8/R9/R10)
+float entryPrice = mLvl
+float slPrice    = na
+float tp1        = na
+float tp2        = na
+if contLong
+    slPrice := mCorr * (1 - slBufPct / 100.0)
+    tp1     := na(mTgt) ? mExt : math.max(mTgt, mExt)
+    tp2     := entryPrice + (entryPrice - slPrice) * rrRunner
+if contShort
+    slPrice := mCorr * (1 + slBufPct / 100.0)
+    tp1     := na(mTgt) ? mExt : math.min(mTgt, mExt)
+    tp2     := entryPrice - (slPrice - entryPrice) * rrRunner
+
+// =====================================================================================
+// PLOTS — LEVELS
+// =====================================================================================
+plot(showLevels ? mSwH : na, "HTF Swing High (sellers)", color=color.new(colBear, 20), style=plot.style_linebr, linewidth=2)
+plot(showLevels ? mSwL : na, "HTF Swing Low (buyers)",  color=color.new(colBull, 20), style=plot.style_linebr, linewidth=2)
+plot(showLevels and mState > 0 ? mLvl : na, "ICC Reaction Level", color=color.new(color.orange, 0), style=plot.style_linebr, linewidth=2)
+
+// NO-TRADE ZONE: a high and a low with no indication (R11)
+bool ntz = mState == 0 and not na(mSwH) and not na(mSwL)
+bgcolor(showNTZ and ntz ? color.new(colNeut, 90) : na, title="No-Trade Zone")
+var box ntzBox = na
+if showNTZ
+    if ntz and na(ntzBox)
+        ntzBox := box.new(bar_index, mSwH, bar_index + 1, mSwL, border_color=colNeut, bgcolor=color.new(colNeut, 92))
+    else if ntz and not na(ntzBox)
+        box.set_right(ntzBox, bar_index + 1)
+        box.set_top(ntzBox, mSwH)
+        box.set_bottom(ntzBox, mSwL)
+    else if not ntz and not na(ntzBox)
+        ntzBox := na
+
+// =====================================================================================
+// PLOTS — STAGE LABELS
+// =====================================================================================
+bool newInd  = mState == 1 and mState[1] != 1
+bool newCorr = mState == 2 and mState[1] != 2
+
+if showLabels and newInd
+    label.new(bar_index, mDir == 1 ? high : low, "IND  (do not trade)", yloc=mDir == 1 ? yloc.abovebar : yloc.belowbar, style=mDir == 1 ? label.style_label_down : label.style_label_up, color=color.new(color.orange, 15), textcolor=color.white, size=size.tiny)
+if showLabels and newCorr
+    label.new(bar_index, mDir == 1 ? low : high, "CORR (liquidity)", yloc=mDir == 1 ? yloc.belowbar : yloc.abovebar, style=mDir == 1 ? label.style_label_up : label.style_label_down, color=color.new(color.gray, 15), textcolor=color.white, size=size.tiny)
+
+plotshape(contLong,  "CONT Long",  style=shape.triangleup,   location=location.belowbar, color=colBull, size=size.small, text="CONT")
+plotshape(contShort, "CONT Short", style=shape.triangledown, location=location.abovebar, color=colBear, size=size.small, text="CONT")
+
+// =====================================================================================
+// PLOTS — RISK FRAME
+// =====================================================================================
+if showRisk and (contLong or contShort)
+    color c = contLong ? colBull : colBear
+    line.new(bar_index, entryPrice, bar_index + 30, entryPrice, color=c, width=2)
+    line.new(bar_index, slPrice,    bar_index + 30, slPrice,    color=color.new(color.red, 0), width=1, style=line.style_dashed)
+    line.new(bar_index, tp1,        bar_index + 30, tp1,        color=color.new(color.teal, 0), width=1, style=line.style_dotted)
+    line.new(bar_index, tp2,        bar_index + 30, tp2,        color=color.new(color.teal, 40), width=1, style=line.style_dotted)
+    label.new(bar_index + 30, entryPrice, "Entry " + str.tostring(entryPrice, format.mintick), style=label.style_label_left, color=color.new(c, 20), textcolor=color.white, size=size.tiny)
+    label.new(bar_index + 30, slPrice,    "SL "    + str.tostring(slPrice,    format.mintick), style=label.style_label_left, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+    label.new(bar_index + 30, tp1,        "TP1 "   + str.tostring(tp1,        format.mintick), style=label.style_label_left, color=color.new(color.teal, 20), textcolor=color.white, size=size.tiny)
+    label.new(bar_index + 30, tp2,        "TP2 "   + str.tostring(tp2,        format.mintick), style=label.style_label_left, color=color.new(color.teal, 40), textcolor=color.white, size=size.tiny)
+
+// =====================================================================================
+// DASHBOARD
+// =====================================================================================
+var table dash = table.new(position.top_right, 2, 7, border_width=1)
+if barstate.islast
+    string sState = mState == 0 ? "NO-TRADE ZONE" : mState == 1 ? "INDICATION" : mState == 2 ? "CORRECTION" : "CONTINUATION"
+    string sDir   = mDir == 1 ? "Bullish" : mDir == -1 ? "Bearish" : "—"
+    string sBias  = bStruct == 1 ? "Uptrend" : bStruct == -1 ? "Downtrend" : "Undefined"
+    string sMk    = mStruct == 1 ? "Uptrend" : mStruct == -1 ? "Downtrend" : "Undefined"
+    string sLtf   = ltfBull ? "Bullish shift" : ltfBear ? "Bearish shift" : "—"
+    table.cell(dash, 0, 0, "ICC", bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, sState, bgcolor=color.new(mState == 3 ? color.teal : mState == 0 ? color.gray : color.orange, 20), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 1, "Direction",  text_size=size.tiny), table.cell(dash, 1, 1, sDir,  text_size=size.tiny)
+    table.cell(dash, 0, 2, "Bias " + tfBias,   text_size=size.tiny), table.cell(dash, 1, 2, sBias, text_size=size.tiny)
+    table.cell(dash, 0, 3, "Markup " + tfMarkup, text_size=size.tiny), table.cell(dash, 1, 3, sMk,  text_size=size.tiny)
+    table.cell(dash, 0, 4, "Chart TF",   text_size=size.tiny), table.cell(dash, 1, 4, sLtf, text_size=size.tiny)
+    table.cell(dash, 0, 5, "Session",    text_size=size.tiny), table.cell(dash, 1, 5, inNY ? "New York" : inLDN ? "London" : "Out of session", text_size=size.tiny)
+    table.cell(dash, 0, 6, "Equal H/L",  text_size=size.tiny), table.cell(dash, 1, 6, eqBlock ? "YES — stand aside" : "No", text_size=size.tiny)
+
+// =====================================================================================
+// ALERTS
+// =====================================================================================
+alertcondition(newInd,    "ICC · Indication",       "ICC: indication printed — new high/low. Information only, do not trade the breakout.")
+alertcondition(newCorr,   "ICC · Correction",       "ICC: correction underway — price back through the level, grabbing liquidity.")
+alertcondition(contLong,  "ICC · Continuation LONG","ICC: continuation LONG — second push above the reaction level, in session, aligned.")
+alertcondition(contShort, "ICC · Continuation SHORT","ICC: continuation SHORT — second push below the reaction level, in session, aligned.")

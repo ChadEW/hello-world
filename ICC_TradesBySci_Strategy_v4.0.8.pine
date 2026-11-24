@@ -1,0 +1,1680 @@
+//@version=5
+// ==========================================================================
+//  ICC_TradesBySci_Strategy_v4.0.8.pine
+//  Pine v5 STRATEGY twin of Expert Advisor ICC_TradesBySci_EA (see PARITY
+//  DEBT below for the exact EA build this twin currently matches).
+//  Sci-style Indication -> Correction -> Continuation (ICC) pullback entries.
+//  BACKTESTING STRATEGY (fires backtest orders + alerts/webhooks; it is a
+//  strategy, not a study/indicator).
+//
+//  v4.0.8 H4 AUTHORITY PORT (+ required External-structure H4 scoping) —
+//  2026-09-03. Mirrors EA v4.2.0, and necessarily also ports the EXTERNAL
+//  half of EA v4.1.0 Findings 1+2 because the two are inseparable.
+//
+//    WHY BOTH: EA v4.2.0 made the MSE External protected-structure trend
+//    (g_extTrend) the AUTHORITATIVE ICC direction, replacing the legacy
+//    cascade biasH4. But in this Pine twin, extTrend was computed on the
+//    CHART timeframe (ta.pivothigh/ta.pivotlow on chart bars), NOT on
+//    MidTF/H4 -- so simply pointing htfBias at extTrend would have produced
+//    CHART-timeframe authority, which is a different strategy, not the EA's.
+//    EA v4.1.0 Findings 1+2 fixed exactly this by forcing External structure
+//    onto MidTF (H4). Porting v4.2.0 without that scoping would be wrong, so
+//    both are delivered together.
+//
+//    NEW INPUT UseExtTrendAuthority (default FALSE):
+//      OFF -> EXACT v4.0.7 behaviour. htfBias is driven by the legacy cascade
+//             biasH4 and External structure stays on the CHART timeframe.
+//             Bar-for-bar identical to v4.0.7.
+//      ON  -> EA v4.2.0 PARITY. (a) External protected swings + BOS trend are
+//             computed on MidTF/H4 via f_extStruct() requested on tfMid, and
+//             (b) htfBias is driven by that extTrend, with D1 remaining a
+//             SOFT conviction weight exactly as before:
+//                 htfScore = extTrend + biasD1 * D1Weight
+//             The legacy cascade biasH4 is RETAINED for dashboard/secondary
+//             visibility only -- mirroring the EA, which kept biasH4 for
+//             display after v4.2.0 made g_extTrend authoritative.
+//
+//    SCOPE OF EFFECT when ON: extTrend / extProtHigh / extProtLow feed FIVE
+//    consumers, all of which move to H4 together (this matches the EA):
+//      1. htfBias / htfScore ................. ICC trade DIRECTION
+//      2. the Indication extOK gate .......... entry permission
+//      3. the R-runner external structure trail
+//      4. RX trend-health (REVERSAL / CAUTION)
+//      5. ML features distance_to_external_high/low_atr + surrogate extPart
+//    This is a LARGE trading-logic change. NOT bar-identical with the toggle
+//    ON -- run the one-variable A/B against the OFF baseline (Master Spec
+//    15.1) before adopting.
+//
+//    LEAKAGE-SAFE: f_extStruct() uses ta.pivothigh/ta.pivotlow (which only
+//    emit once the required NEWER bars have printed) and reads close[1]/
+//    high[1]/low[1] for the BOS test, all inside a request.security() call
+//    with lookahead=barmerge.lookahead_off -- so only CONFIRMED H4 pivots on
+//    CLOSED H4 bars are ever used, matching the EA's MSE_FindProtected +
+//    MSE_UpdateTrendScale discipline.
+//
+//    Diagnostics: the [ICC GATE] LONG/SHORT lines now print BOTH h4cascade
+//    (legacy biasH4) and h4ext (authoritative extTrend) plus which one is
+//    governing (htfSrc), mirroring the EA v4.2.1 fix (B) that added
+//    H4ext=g_extTrend to the verbose line. A new dashboard row shows the
+//    same. This makes "why did it trade when H4 looks bearish" answerable
+//    from a single line, which was the exact ambiguity the EA fix addressed.
+//
+//  v4.0.7 STRUCTURAL CORRECTION DEFINITION PORT — 2026-09-03. Mirrors the
+//  EA v4.3.0 fidelity fix 1:1. Trades-by-Sci defines a Correction
+//  STRUCTURALLY -- a counter-trend leg that prints a confirmed LOWER HIGH
+//  (bull) or HIGHER LOW (bear), valid for as long as the IMPULSE ORIGIN
+//  holds -- not by a fib percentage. Input UseStructuralCorrection
+//  (default FALSE) selects; StructCorrMinRetrace is the anti-noise floor;
+//  StructCorrKeepMaxDepth optionally retains the CorrRetraceMax cap. In
+//  STRUCTURAL mode the shallow edge handed to f_fvgContainOK() becomes the
+//  correction's OWN confirmed LH/HL instead of the 0.50 fib level.
+//
+//  ------------------------------------------------------------------------
+//  *** PARITY DEBT — READ BEFORE ASSUMING EA<->PINE EQUIVALENCE ***
+//  With UseExtTrendAuthority=ON and UseStructuralCorrection=ON this twin now
+//  matches the EA on H4 authority (v4.2.0) and the correction definition
+//  (v4.3.0). The following EA changes remain NOT ported, and each one alters
+//  signal generation:
+//    (EA v4.1.0, INTERNAL half) Internal structure + liquidity/FVG/OB/
+//      displacement should compute on WorkTF/H1. THIS TWIN still computes
+//      them on the CHART timeframe. Only the EXTERNAL half was ported in
+//      v4.0.8 (it was a hard prerequisite for H4 authority).
+//    (EA v4.1.0 Finding 3) Continuation trigger. THIS TWIN still uses
+//      m15h2/m15l2 -- the rolling, UNCONFIRMED "2 bars ago" offset. The
+//      f_minorPivot() infrastructure added in v4.0.7 makes this a one-line
+//      swap (m15h2 -> mpHi, m15l2 -> mpLo) whenever approved.
+//    (EA v4.2.1) Sweep pool = nearest internal swing / equal-level cluster.
+//      THIS TWIN still uses the LiqLookback range extreme -- the exact
+//      construct that produced ZERO signals in the EA.
+//    (EA v4.2.4) InpHTFStrictBoundary A/B toggle -- not present here. NOTE:
+//      the htfBias block below is now structured so this is a small, clean
+//      addition whenever approved.
+//    (EA v4.2.6) Equal-level magnet fractal strength -- N/A (no separate
+//      equal-level detector in this twin).
+//    (EA v4.2.7) Sweep validity counted in H1 bars -- THIS TWIN decrements
+//      sweepConfLong/Short once per CHART bar.
+//    (EA v4.2.8) Guarded stop-modify -- N/A (Pine has no broker modify).
+//    (EA v4.2.9) ML money layer (initial_risk_money / mfe_money / mae_money,
+//      schema 4.0.2) -- this twin still emits schema_version "4.0.1".
+//  Do not treat backtests from this twin as EA-equivalent until the items
+//  above are ported and each is A/B validated on its own.
+//  ------------------------------------------------------------------------
+//
+//  v4.0.6 ML HOSTILE-AUDIT PARITY PORT — 2026-09-01. (F2) f_mlSurrogate()
+//  score-collapse rebalance; (F7-equivalent) genuine v4 telemetry capture
+//  plus the missing impulse_age_bars / correction_age_bars JSON fields.
+//
+//  v4.0.5 GATE-DIAGNOSTIC CALL-PATH FIX — 2026-08-31. Emits the [ICC GATE]
+//  state BEFORE the data guard, adds an explicit DATA-GUARD log and an
+//  engine-OFF log so the ICC engine can never go dark silently.
+//
+//  --- prior history (unchanged) ---
+//  ML v4 CANONICAL WEBHOOK PORT; v3.9.0 icc_ml_v2 TRUE-2R TRADE PAYLOAD;
+//  v3.8.1 STARTUP VERIFICATION PAYLOAD; v3.8.0 ML FEATURE EXPANSION;
+//  v3.7.0 ML ENABLEMENT LAYER; v3.6.1 DUAL FLOATING-P/L READOUT;
+//  v3.6.0 EXIT ENGINE OVERHAUL (R-MULTIPLE PHASED RUNNER);
+//  v3.5.0 SCI-PURITY CLEANUP + LET-WINNERS-RUN;
+//  v3.4.0 KILL-ZONE SESSIONS + OTE ENTRY WINDOW. All preserved unchanged.
+//
+//  NOTE ON PLATFORM PARITY: Pine strategies cannot place live broker orders;
+//  they backtest and can fire alerts/webhooks. Kill-zone hours are read in the
+//  configurable 'Kill-zone timezone' so you can line them up with the EA's
+//  broker-server clock.
+//  Built for Chad Woodyard, August 2026.
+// ==========================================================================
+strategy("ICC TradesBySci Strategy v4.0.8",
+     shorttitle       = "ICC-Sci v4.0.8",
+     overlay          = true,
+     pyramiding       = 0,
+     initial_capital  = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value= 100,
+     calc_on_every_tick = false,
+     process_orders_on_close = true)
+
+// ============================ INPUTS =====================================
+grpPaths = "=== Entry Path (Sci ICC only) ==="
+UseICCPullback    = input.bool(true,  "Sci Indication->Correction->Continuation pullback (the ONLY entry path)", group=grpPaths)
+CloseOnOpposite   = input.bool(true,  "Close open trade on an opposite ICC continuation (structure flip)",      group=grpPaths)
+
+grpBias = "=== Bias / Filter (Sci: HTF sets bias, LTF entry) ==="
+BiasLoose        = input.bool(true,  "Single BOS sets trend (HH w/o LL = bull)", group=grpBias)
+UseD1Filter      = input.bool(true,  "Let D1 influence HTF bias as a SOFT weight",group=grpBias)
+D1Weight         = input.float(0.5,  "D1 weight vs H4 (0=ignore .. >1 D1 dominates)", step=0.1, group=grpBias)
+HTF_MinConviction= input.float(0.5,  "Min net HTF score (same side as H4) to trade", step=0.1, group=grpBias)
+// --------------------------------------------------------------------------
+//  v4.0.8 H4 AUTHORITY (mirrors EA v4.2.0 + the External half of EA v4.1.0).
+//  OFF (default) = EXACT v4.0.7: htfBias driven by the legacy cascade biasH4,
+//  External structure on the CHART timeframe. Bar-for-bar identical.
+//  ON = EA parity: External protected swings + BOS computed on MidTF/H4, and
+//  that extTrend becomes the AUTHORITATIVE ICC direction (D1 stays a soft
+//  conviction weight). See the file header for the full scope-of-effect note.
+// --------------------------------------------------------------------------
+UseExtTrendAuthority = input.bool(false, "H4 AUTHORITY: External protected-structure trend on MidTF drives direction (OFF = legacy cascade biasH4)", group=grpBias)
+
+grpICC = "=== ICC Pullback Tuning ==="
+CorrRetraceMin = input.float(0.500, "Min pullback into discount/premium (fib)", step=0.01, group=grpICC)
+CorrRetraceMax = input.float(0.900, "Max pullback before invalidation (fib)",   step=0.01, group=grpICC)
+ICC_ExpiryBars = input.int(30, "Bars to complete Correction+Continuation, else reset", minval=1, group=grpICC)
+
+// --------------------------------------------------------------------------
+//  v4.0.7 STRUCTURAL CORRECTION DEFINITION (mirrors EA v4.3.0).
+//  OFF (default) = EXACT v4.0.6 fib-band behaviour, bar-for-bar identical.
+// --------------------------------------------------------------------------
+grpSC = "=== ICC Correction Definition (v4.0.7 / EA v4.3.0 parity) ==="
+UseStructuralCorrection = input.bool(false, "Correction = structural LH/HL + impulse-origin hold (OFF = 0.50-0.90 fib band)", group=grpSC)
+StructCorrMinRetrace    = input.float(0.10, "Structural: min fraction of the impulse leg retraced before a pivot counts (anti-noise floor)", minval=0.0, maxval=0.9, step=0.01, group=grpSC)
+StructCorrKeepMaxDepth  = input.bool(false, "Structural: ALSO keep the CorrRetraceMax deep-invalidation cap as a secondary guard", group=grpSC)
+MinorPivotStrength      = input.int(1, "Confirmed minor-pivot fractal strength on the Trigger TF (bars each side)", minval=1, group=grpSC)
+
+// v4.0.4/4.0.5: ICC gate diagnostics (mirror of the EA InpICCGateDiagnostics).
+grpDiag = "=== ICC Gate Diagnostics (v4.0.5) ==="
+inpICCGateDiagnostics = input.bool(false, "Log ICC indication/continuation gate reasons (does NOT change trading logic)", group=grpDiag)
+
+grpTF = "=== Timeframe Cascade (Sci D1->H4->H1->M15) ==="
+tfBias = input.timeframe("D",   "Top bias TF (D1)",         group=grpTF)
+tfMid  = input.timeframe("240", "Mid / Indication TF (H4) - External structure TF when H4 AUTHORITY is ON", group=grpTF)
+tfWork = input.timeframe("60",  "Working TF / swing anchor (H1)", group=grpTF)
+tfTrig = input.timeframe("15",  "Trigger TF / entry timing (M15)", group=grpTF)
+CascadeSwingLen = input.int(5, "Pivot length per-TF for cascade", minval=2, group=grpTF)
+
+grpSL = "=== Stop Loss / Sizing ==="
+ATR_Multiplier = input.float(1.5, "ATR multiplier", step=0.1, group=grpSL)
+ATR_Period     = input.int(14, "ATR period", minval=1, group=grpSL)
+SL_BufferPips  = input.float(5.0, "Extra structural SL buffer (pips)", step=0.5, group=grpSL)
+RR_Ratio       = input.float(2.0, "TP reward : risk (fixed-RR)", step=0.1, group=grpSL)
+
+grpTP = "=== Take-Profit Mode (v2.2 parity) ==="
+TPMode      = input.string("Fixed RR", "TP target", options=["Fixed RR","Structural"], group=grpTP)
+TPLookback  = input.int(200, "Structural: bars scanned for fallback swing target", minval=10, group=grpTP)
+TPMinRR     = input.float(1.0, "Structural: reject/floor targets below this RR", step=0.1, group=grpTP)
+
+grpRun = "=== Let Winners Run (Sci runner) ==="
+LetWinnersRun    = input.bool(true,  "Ride winners: no fixed TP; profit-lock ratchet keeps a profitable trade open", group=grpRun)
+RunnerArmPips    = input.float(20.0, "Profit (pips) before the profit-lock arms", step=0.5, group=grpRun)
+RunnerLockPips   = input.float(4.0,  "Profit (pips) locked in at arm (break-even + this)", step=0.5, group=grpRun)
+RunnerTrailPips  = input.float(15.0, "Trail behind peak by this many pips once armed (0 = structure-only trail)", step=0.5, group=grpRun)
+RunnerUseStruct  = input.bool(true,  "Also trail behind the last protected internal swing (structure trail)", group=grpRun)
+
+grpRex = "=== Exit Engine v3.6 (R-multiple runner) ==="
+useRexit           = input.bool(true,  "MASTER: use the R-multiple phased exit engine (OFF = exact v3.5.0 runner)", group=grpRex)
+protectAtR         = input.float(1.0,  "+R to move the stop to break-even (Phase 2 protect)", step=0.1, group=grpRex)
+protectLockR       = input.float(0.0,  "R locked at protect (0 = pure break-even)", step=0.1, group=grpRex)
+lockAtR            = input.float(1.5,  "+R at which to lock meaningful profit (Phase 2b)", step=0.1, group=grpRex)
+lockProfitR        = input.float(0.5,  "R of profit locked from +lockAtR onward", step=0.1, group=grpRex)
+activateAtR        = input.float(2.0,  "+R to activate the STRUCTURE RUNNER (Phase 3)", step=0.1, group=grpRex)
+runnerGiveBackR    = input.float(2.0,  "Progressive floor beyond activation: lock (curR - this) in R", step=0.1, group=grpRex)
+runnerExternStruct = input.bool(true,  "Runner trails behind PROTECTED EXTERNAL structure (primary)", group=grpRex)
+runnerInternStruct = input.bool(true,  "Runner also trails behind protected INTERNAL structure (aggressive)", group=grpRex)
+runnerATRFloor     = input.bool(true,  "Keep a wide ATR emergency floor under the runner", group=grpRex)
+runnerATRfloorMult = input.float(3.0,  "ATR emergency-floor multiple (wide)", step=0.1, group=grpRex)
+usePartial         = input.bool(false, "Take an optional partial at +activateAtR (leave the rest running)", group=grpRex)
+partialPct         = input.float(25.0, "Percent of the position to close at the partial (0..100)", step=1, group=grpRex)
+useTrendHealth     = input.bool(true,  "Trend-health governor (HEALTHY hold / CAUTION tighten / REVERSAL exit)", group=grpRex)
+closeOnConfirmedRev= input.bool(true,  "Opposite ICC closes a runner ONLY with a confirmed external reversal", group=grpRex)
+
+// ---- SMC engine (structure / liquidity / displacement / FVG / OB) --------
+grpStruct = "=== SMC: Structure & Protected Swings ==="
+IntSwingStrength = input.int(2, "Internal swing fractal strength (entries)", minval=1, group=grpStruct)
+ExtSwingStrength = input.int(4, "External swing fractal strength (direction)", minval=1, group=grpStruct)
+BOSUseClose      = input.bool(true, "BOS requires a BODY close beyond the protected swing", group=grpStruct)
+ExtTrendControlsDir = input.bool(true, "External trend gates trade DIRECTION", group=grpStruct)
+IntTrendControlsEnt = input.bool(true, "Internal BOS gates the ENTRY (Indication)", group=grpStruct)
+
+grpLiq = "=== SMC: Liquidity Engine ==="
+RequireSweep   = input.bool(true, "Require a liquidity sweep + reclaim before Indication", group=grpLiq)
+LiqLookback    = input.int(120, "Bars scanned for liquidity pools", minval=10, group=grpLiq)
+RequireReclaim = input.bool(true, "Require price to RECLAIM the swept level", group=grpLiq)
+ReclaimBars    = input.int(3, "Bars allowed for the reclaim", minval=1, group=grpLiq)
+SweepValidBars = input.int(8, "Sweep arms an Indication for N bars", minval=1, group=grpLiq)
+SweepMinPips   = input.float(1.0, "Min penetration beyond the level (pips)", step=0.5, group=grpLiq)
+
+grpFVG = "=== SMC: Fair Value Gaps ==="
+RequireFVGpullback = input.bool(true, "Correction must pull back into an active FVG", group=grpFVG)
+DrawFVG         = input.bool(true, "Draw detected FVGs", group=grpFVG)
+MaxTrackedFVG   = input.int(40, "Max FVGs held in memory", minval=4, group=grpFVG)
+MinFVGPips      = input.float(1.0, "Min FVG size (pips)", step=0.5, group=grpFVG)
+
+grpDisp = "=== SMC: Institutional Displacement ==="
+RejectWeakBreaks = input.bool(true, "Reject Indication breaks below the score threshold", group=grpDisp)
+DispATRMult      = input.float(1.5, "Range >= ATR*mult scores full ATR points", step=0.1, group=grpDisp)
+DispMinBodyPct   = input.float(0.50, "Min body/range for a clean displacement", step=0.05, group=grpDisp)
+DispMinCloseStr  = input.float(0.60, "Min closing strength (close near the extreme)", step=0.05, group=grpDisp)
+DispMaxWickRatio = input.float(1.00, "Max opposing-wick/body ratio tolerated", step=0.1, group=grpDisp)
+DispMinScore     = input.float(60.0, "Reject displacements below this (0..100)", step=1, group=grpDisp)
+
+grpOB = "=== SMC: Order / Mitigation Blocks ==="
+UseOrderBlocks = input.bool(true, "Enable order-block detection & tracking", group=grpOB)
+RequireOB      = input.bool(false, "OB is CONFLUENCE, not a hard gate (default off)", group=grpOB)
+MaxTrackedOB   = input.int(40, "Max order blocks held in memory", minval=4, group=grpOB)
+DrawOB         = input.bool(true, "Draw order blocks", group=grpOB)
+
+grpRelax = "=== SMC: FVG Containment Relaxation (v3.3.9) ==="
+RelaxFVGContain   = input.bool(false, "Relax the continuation active-FVG containment test", group=grpRelax)
+FVGContainTolPips = input.float(5.0, "Containment tolerance (pips)", step=0.5, group=grpRelax)
+UseFVGband        = input.bool(true, "Also accept when the discount/premium BAND overlaps a gap", group=grpRelax)
+
+grpExit = "=== Exit Labels (v3.3.10) ==="
+ShowExitLabels    = input.bool(true, "Draw a label at each closed trade", group=grpExit)
+ExitLblShowProfit = input.bool(true, "Include net profit on the exit label", group=grpExit)
+ExitWinColor      = input.color(color.teal,   "Winning-exit label colour", group=grpExit)
+ExitLossColor     = input.color(color.maroon, "Losing-exit label colour",  group=grpExit)
+
+grpKZ = "=== Sci Kill-Zone Sessions (v3.4.0) ==="
+useKZ     = input.bool(false, "Gate ALL entries to Sci kill zones", group=grpKZ)
+kzTz      = input.string("GMT+3", "Kill-zone timezone (match your EA broker-server clock)", group=grpKZ)
+kzLon     = input.bool(true, "Enable London Open kill zone", group=grpKZ)
+lonStart  = input.int(7,  "London KZ start hour (0-23)", minval=0, maxval=23, group=grpKZ)
+lonEnd    = input.int(10, "London KZ end hour (0-23)",   minval=0, maxval=23, group=grpKZ)
+kzNYam    = input.bool(true, "Enable New York AM kill zone", group=grpKZ)
+nyamStart = input.int(12, "NY AM KZ start hour (0-23)", minval=0, maxval=23, group=grpKZ)
+nyamEnd   = input.int(15, "NY AM KZ end hour (0-23)",   minval=0, maxval=23, group=grpKZ)
+kzNYpm    = input.bool(true, "Enable New York PM kill zone", group=grpKZ)
+nypmStart = input.int(17, "NY PM KZ start hour (0-23)", minval=0, maxval=23, group=grpKZ)
+nypmEnd   = input.int(20, "NY PM KZ end hour (0-23)",   minval=0, maxval=23, group=grpKZ)
+
+grpOTE = "=== Sci OTE Entry Window (v3.4.0) ==="
+useOTE = input.bool(false, "Require correction into the 0.62-0.79 OTE band", group=grpOTE)
+oteMin = input.float(0.62, "OTE shallow edge (min retrace of the impulse)", step=0.01, group=grpOTE)
+oteMax = input.float(0.79, "OTE deep edge (max retrace before invalidation)", step=0.01, group=grpOTE)
+
+grpDash = "=== Visuals ==="
+ShowDashboard = input.bool(true, "Show dashboard table", group=grpDash)
+
+// ============================ ML ENABLEMENT v3.7 =========================
+grpML = "=== ML Enablement v3.7 ==="
+mlMode = input.string("OFF", "ML mode", options=["OFF","OBSERVE","FILTER","FILTER+SIZE"], group=grpML)
+mlSource = input.string("SURROGATE", "Score source", options=["SURROGATE","MANUAL/EXTERNAL"], group=grpML)
+mlMinScore = input.float(0.70, "Minimum trade-quality probability", minval=0.0, maxval=1.0, step=0.01, group=grpML)
+mlManualP2 = input.float(0.75, "External probability: reach 2R", minval=0.0, maxval=1.0, step=0.01, group=grpML)
+mlManualP3 = input.float(0.60, "External probability: reach 3R", minval=0.0, maxval=1.0, step=0.01, group=grpML)
+mlManualP5 = input.float(0.35, "External probability: reach 5R", minval=0.0, maxval=1.0, step=0.01, group=grpML)
+mlManualP10= input.float(0.10, "External probability: reach 10R", minval=0.0, maxval=1.0, step=0.01, group=grpML)
+mlForecastDir = input.int(0, "External forecast direction (-1 short, 0 neutral, +1 long)", minval=-1, maxval=1, group=grpML)
+mlForecastStrength = input.float(0.0, "External forecast strength (ATR units)", minval=0.0, step=0.1, group=grpML)
+mlRequireForecast = input.bool(false, "Require forecast agreement with ICC direction", group=grpML)
+mlRunnerMinP3 = input.float(0.55, "Use open-ended runner when P(3R) >=", minval=0.0, maxval=1.0, step=0.01, group=grpML)
+mlLowMult = input.float(0.50, "Sizing multiplier below 70%", minval=0.0, step=0.05, group=grpML)
+mlBaseMult= input.float(1.00, "Sizing multiplier from 70% to 84%", minval=0.0, step=0.05, group=grpML)
+mlHighMult= input.float(2.00, "Sizing multiplier at 85%+", minval=0.0, step=0.05, group=grpML)
+mlBaseEquityPct = input.float(100.0, "Pine approximate base equity % for ML sizing", minval=0.1, step=0.1, group=grpML)
+mlExportJSON = input.bool(true, "Emit JSON feature payload on each raw ICC signal", group=grpML)
+mlEmitStartup = input.bool(true, "Emit one-time startup verification payload (pipeline test)", group=grpML)
+mlEmitTradeJSON = input.bool(true, "Emit JSON trade payload on each closed trade (icc_ml_v2 true 2R label)", group=grpML)
+mlEmitV4JSON  = input.bool(true, "Emit ML v4 canonical JSON trade payload on close (mirror of EA ICC_ML_dataset_v4)", group=grpML)
+mlV4IncludeSurrogate = input.bool(false, "v4: include surrogate probabilities (diagnostics only; never a target)", group=grpML)
+
+// ============================ HELPERS ====================================
+// Pip size mirrors the EA: fractional-FX / metals scale point*10.
+isMetalSym = str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "XAG") or str.contains(syminfo.ticker, "GOLD") or str.contains(syminfo.ticker, "SILVER")
+pip = syminfo.mintick * (((syminfo.mintick == 0.00001 or syminfo.mintick == 0.001) or isMetalSym) ? 10.0 : 1.0)
+
+atrVal    = ta.atr(ATR_Period)
+fvgMin    = MinFVGPips  * pip
+sweepMin  = SweepMinPips * pip
+slBuf     = SL_BufferPips * pip
+fvgTol    = FVGContainTolPips * pip
+
+// ---- Multi-TF bias (Sci cascade). f_bias() runs inside each security ctx.
+f_bias() =>
+    ph = ta.pivothigh(CascadeSwingLen, CascadeSwingLen)
+    pl = ta.pivotlow(CascadeSwingLen, CascadeSwingLen)
+    var float lastHi = na
+    var float prevHi = na
+    var float lastLo = na
+    var float prevLo = na
+    if not na(ph)
+        prevHi := lastHi
+        lastHi := ph
+    if not na(pl)
+        prevLo := lastLo
+        lastLo := pl
+    hh = not na(lastHi) and not na(prevHi) and lastHi > prevHi
+    hl = not na(lastLo) and not na(prevLo) and lastLo > prevLo
+    lh = not na(lastHi) and not na(prevHi) and lastHi < prevHi
+    ll = not na(lastLo) and not na(prevLo) and lastLo < prevLo
+    b = 0
+    if BiasLoose
+        b := hh and not ll ? 1 : ll and not hh ? -1 : 0
+    else
+        b := hh and hl ? 1 : lh and ll ? -1 : 0
+    b
+
+biasD1  = request.security(syminfo.tickerid, tfBias, f_bias(), lookahead=barmerge.lookahead_off)
+biasH4  = request.security(syminfo.tickerid, tfMid,  f_bias(), lookahead=barmerge.lookahead_off)
+biasH1  = request.security(syminfo.tickerid, tfWork, f_bias(), lookahead=barmerge.lookahead_off)
+biasM15 = request.security(syminfo.tickerid, tfTrig, f_bias(), lookahead=barmerge.lookahead_off)
+
+// ==========================================================================
+//  v4.0.8 EXTERNAL PROTECTED STRUCTURE (mirrors EA MSE_FindProtected +
+//  MSE_UpdateTrendScale run on g_extTF). Computed BOTH on the chart TF (the
+//  legacy v4.0.7 path) and on MidTF/H4 (the EA-parity path), then SELECTED by
+//  UseExtTrendAuthority. Declared HERE -- above htfScore/htfBias -- because
+//  the H4-authority bias must be able to read extTrend, and Pine requires
+//  declaration before use.
+//  f_extStruct() returns the newest CONFIRMED protected high/low and the
+//  BOS-driven trend for whatever context it is evaluated in. Inside a
+//  request.security() with lookahead_off, and using ta.pivothigh/pivotlow +
+//  close[1]/high[1]/low[1], only CONFIRMED pivots on CLOSED bars are used.
+// ==========================================================================
+f_extStruct() =>
+    ph = ta.pivothigh(ExtSwingStrength, ExtSwingStrength)
+    pl = ta.pivotlow(ExtSwingStrength, ExtSwingStrength)
+    var float pHi = na
+    var float pLo = na
+    var int   tr  = 0
+    if not na(ph)
+        pHi := ph
+    if not na(pl)
+        pLo := pl
+    bh = BOSUseClose ? close[1] : high[1]
+    bl = BOSUseClose ? close[1] : low[1]
+    if not na(pHi) and bh > pHi
+        tr := 1
+    else if not na(pLo) and bl < pLo
+        tr := -1
+    [pHi, pLo, tr]
+
+// EA-parity path: External structure on MidTF (H4).
+[extProtHighH4, extProtLowH4, extTrendH4] = request.security(syminfo.tickerid, tfMid, f_extStruct(), lookahead=barmerge.lookahead_off)
+
+// Legacy v4.0.7 path: External structure on the CHART timeframe.
+[extProtHighCh, extProtLowCh, extTrendCh] = f_extStruct()
+
+// SELECT. When H4 AUTHORITY is ON these three feed every downstream external
+// consumer (direction, Indication extOK gate, runner external trail, RX
+// trend-health, ML external-distance features) -- exactly as in the EA.
+extProtHigh = UseExtTrendAuthority ? extProtHighH4 : extProtHighCh
+extProtLow  = UseExtTrendAuthority ? extProtLowH4  : extProtLowCh
+extTrend    = UseExtTrendAuthority ? extTrendH4    : extTrendCh
+
+// ==========================================================================
+//  HTF DIRECTION. v4.0.8 (mirrors EA v4.2.0): when H4 AUTHORITY is ON the
+//  authoritative direction source is the MSE External protected-structure
+//  trend (extTrend); the legacy cascade biasH4 is retained for dashboard /
+//  secondary visibility ONLY. D1 remains a SOFT conviction weight in both
+//  arms: score = <source> + biasD1 * D1Weight, thresholded by
+//  HTF_MinConviction.
+//  (PARITY DEBT: EA v4.2.4's InpHTFStrictBoundary strict >/< comparison is
+//  not ported; this twin uses the inclusive >=/<= form, matching EA default.)
+// ==========================================================================
+htfSrc   = UseExtTrendAuthority ? extTrend : biasH4
+htfScore = UseD1Filter ? htfSrc + biasD1 * D1Weight : htfSrc
+htfBias  = htfSrc == 0 ? 0 : (not UseD1Filter ? htfSrc : (htfSrc == 1 and htfScore >= HTF_MinConviction ? 1 : htfSrc == -1 and htfScore <= -HTF_MinConviction ? -1 : 0))
+
+// v3.5.0: loose LTF alignment retained ONLY as a dashboard readout.
+alignBull = biasH1==1 and biasM15==1
+alignBear = biasH1==-1 and biasM15==-1
+
+// ---- WorkTF / TrigTF prices (last closed) via security -------------------
+wkH1  = request.security(syminfo.tickerid, tfWork, high[1], lookahead=barmerge.lookahead_off)
+wkL1  = request.security(syminfo.tickerid, tfWork, low[1],  lookahead=barmerge.lookahead_off)
+m15c1 = request.security(syminfo.tickerid, tfTrig, close[1],lookahead=barmerge.lookahead_off)
+m15h2 = request.security(syminfo.tickerid, tfTrig, high[2], lookahead=barmerge.lookahead_off)
+m15l2 = request.security(syminfo.tickerid, tfTrig, low[2],  lookahead=barmerge.lookahead_off)
+
+// --------------------------------------------------------------------------
+//  v4.0.7 CONFIRMED MINOR-PIVOT TRACKER (Pine analogue of the EA's
+//  ICC_FindMinorPivotHigh/Low). ta.pivothigh/ta.pivotlow only emit once
+//  MinorPivotStrength NEWER bars have printed, and the security call uses
+//  lookahead=barmerge.lookahead_off, so this is leakage-free by construction.
+//  (It also makes the deferred EA v4.1.0 Finding-3 continuation-trigger port
+//  a one-line swap: m15h2 -> mpHi and m15l2 -> mpLo, whenever approved.)
+// --------------------------------------------------------------------------
+f_minorPivot() =>
+    ph = ta.pivothigh(MinorPivotStrength, MinorPivotStrength)
+    pl = ta.pivotlow(MinorPivotStrength, MinorPivotStrength)
+    var float lastPH = na
+    var float lastPL = na
+    if not na(ph)
+        lastPH := ph
+    if not na(pl)
+        lastPL := pl
+    [lastPH, lastPL]
+
+[mpHi, mpLo] = request.security(syminfo.tickerid, tfTrig, f_minorPivot(), lookahead=barmerge.lookahead_off)
+
+// --------------------------------------------------------------------------
+//  v4.0.7 STRUCTURAL CORRECTION HELPERS (mirror of EA v4.3.0
+//  ICC_StructuralCorrectionOK / ICC_StructuralInvalidated). Both are PURE
+//  reads -- they mutate no ICC state.
+// --------------------------------------------------------------------------
+f_structCorrEdge(dir, leg, indExt) =>
+    float edge = na
+    if leg > 0
+        floorDist = math.max(0.0, StructCorrMinRetrace) * leg
+        if dir == 1
+            if not na(mpHi) and mpHi > 0 and mpHi < indExt - floorDist
+                edge := mpHi
+        else if dir == -1
+            if not na(mpLo) and mpLo > 0 and mpLo > indExt + floorDist
+                edge := mpLo
+    edge
+
+f_structInval(dir, c1, lvl) =>
+    (lvl > 0 and not na(c1) and c1 > 0) ? (dir == 1 ? c1 < lvl : dir == -1 ? c1 > lvl : false) : false
+
+// ============================ SMC STRUCTURE ==============================
+//  EXTERNAL protected structure was MOVED UP (above htfScore/htfBias) in
+//  v4.0.8 so the H4-authority bias can read extTrend -- see the "EXTERNAL
+//  PROTECTED STRUCTURE" block in the HELPERS section. Only the INTERNAL
+//  scale remains here.
+//  PARITY DEBT (EA v4.1.0 Findings 1+2, INTERNAL half): the EA computes
+//  Internal structure -- and the liquidity/FVG/OB/displacement engines that
+//  feed the entry side -- on WorkTF/H1. THIS TWIN still computes them on the
+//  CHART timeframe. Only the EXTERNAL half was ported in v4.0.8, because it
+//  was a hard prerequisite for H4 authority.
+iph = ta.pivothigh(IntSwingStrength, IntSwingStrength)
+ipl = ta.pivotlow(IntSwingStrength, IntSwingStrength)
+var float intProtHigh = na
+var float intProtLow  = na
+if not na(iph)
+    intProtHigh := iph
+if not na(ipl)
+    intProtLow := ipl
+
+// v3.6.0: internal-structure trend (BOS on protected internal swings).
+var int intTrend = 0
+biH = BOSUseClose ? close[1] : high[1]
+biL = BOSUseClose ? close[1] : low[1]
+if not na(intProtHigh) and biH > intProtHigh
+    intTrend := 1
+else if not na(intProtLow) and biL < intProtLow
+    intTrend := -1
+
+// Feed protected internal swings to the ICC anchors (like EA MSE_Update).
+wkLastHi = IntTrendControlsEnt and not na(intProtHigh) ? intProtHigh : intProtHigh
+wkLastLo = IntTrendControlsEnt and not na(intProtLow)  ? intProtLow  : intProtLow
+
+// ============================ LIQUIDITY ENGINE ===========================
+// PARITY DEBT (EA v4.2.1): the EA builds the sweep pool from the NEAREST
+// internal protected swing / equal-level cluster. This twin still uses the
+// LiqLookback range extreme -- the construct that produced zero EA signals.
+bsl = ta.highest(high, LiqLookback)[1]
+ssl = ta.lowest(low,  LiqLookback)[1]
+
+var int sweepConfLong  = 0
+var int sweepConfShort = 0
+var float lastSweepLvl = na
+
+// PARITY DEBT (EA v4.2.7): the EA decrements this once per WorkTF/H1 bar.
+if sweepConfLong  > 0
+    sweepConfLong  := sweepConfLong  - 1
+if sweepConfShort > 0
+    sweepConfShort := sweepConfShort - 1
+
+// Sell-side sweep (raid of lows -> look LONG)
+sweptLong  = not na(ssl) and (low[1]  < ssl - sweepMin) and (close[1] > ssl)
+// Buy-side sweep (raid of highs -> look SHORT)
+sweptShort = not na(bsl) and (high[1] > bsl + sweepMin) and (close[1] < bsl)
+
+f_reclaimUp(lvl) =>
+    ok = not RequireReclaim
+    if RequireReclaim
+        for s = 1 to ReclaimBars
+            if close[s] > lvl
+                ok := true
+    ok
+
+f_reclaimDn(lvl) =>
+    ok = not RequireReclaim
+    if RequireReclaim
+        for s = 1 to ReclaimBars
+            if close[s] < lvl
+                ok := true
+    ok
+
+if sweptLong and f_reclaimUp(ssl)
+    sweepConfLong := SweepValidBars
+    lastSweepLvl := ssl
+else if sweptShort and f_reclaimDn(bsl)
+    sweepConfShort := SweepValidBars
+    lastSweepLvl := bsl
+
+liqStatus = sweepConfLong > 0 ? "long armed (" + str.tostring(sweepConfLong) + ")" : sweepConfShort > 0 ? "short armed (" + str.tostring(sweepConfShort) + ")" : "watching pools"
+
+// ============================ DISPLACEMENT ===============================
+f_disp(dir) =>
+    o = open[1]
+    c = close[1]
+    h = high[1]
+    l = low[1]
+    rng = h - l
+    score = 0.0
+    if rng > 0.0
+        dirOk = dir == 1 ? c > o : c < o
+        if dirOk
+            body     = math.abs(c - o)
+            bodyPct  = body / rng
+            closeStr = dir == 1 ? (c - l) / rng : (h - c) / rng
+            oppWick  = dir == 1 ? (h - c) : (c - l)
+            wickRat  = body > 0.0 ? oppWick / body : 999.0
+            atrFac   = atrVal > 0.0 ? rng / atrVal : 0.0
+            sBody  = math.min(bodyPct  / math.max(DispMinBodyPct, 0.01), 1.0) * 30.0
+            sClose = math.min(closeStr / math.max(DispMinCloseStr,0.01), 1.0) * 25.0
+            sWick  = math.min(DispMaxWickRatio / math.max(wickRat, 0.0001), 1.0) * 15.0
+            sATR   = math.min(atrFac  / math.max(DispATRMult,    0.01), 1.0) * 30.0
+            score := math.min(sBody + sClose + sWick + sATR, 100.0)
+    score
+
+var float lastDispScore = 0.0
+
+// ============================ FAIR VALUE GAPS ============================
+var array<float> fvgTop    = array.new_float()
+var array<float> fvgBot    = array.new_float()
+var array<int>   fvgDir    = array.new_int()
+var array<bool>  fvgActive = array.new_bool()
+var array<box>   fvgBox    = array.new_box()
+
+f_pushFVG(t, b, d) =>
+    array.push(fvgTop, t)
+    array.push(fvgBot, b)
+    array.push(fvgDir, d)
+    array.push(fvgActive, true)
+    bx = DrawFVG ? box.new(bar_index-2, t, bar_index, b, border_color=na, bgcolor=color.new(d==1?color.teal:color.maroon, 80)) : na
+    array.push(fvgBox, bx)
+    if array.size(fvgTop) > MaxTrackedFVG
+        obx = array.shift(fvgBox)
+        if not na(obx)
+            box.delete(obx)
+        array.shift(fvgTop)
+        array.shift(fvgBot)
+        array.shift(fvgDir)
+        array.shift(fvgActive)
+
+// Bullish FVG: low[1] > high[3] (gap across candle [2]); bearish mirror.
+bullFVG = low[1]  - high[3] >= fvgMin
+bearFVG = low[3]  - high[1] >= fvgMin
+if bullFVG
+    f_pushFVG(low[1], high[3], 1)
+if bearFVG
+    f_pushFVG(low[3], high[1], -1)
+
+// Invalidate fully-filled gaps; extend active boxes to the right.
+if array.size(fvgActive) > 0
+    for i = 0 to array.size(fvgActive) - 1
+        if array.get(fvgActive, i)
+            t = array.get(fvgTop, i)
+            b = array.get(fvgBot, i)
+            d = array.get(fvgDir, i)
+            if d == 1 and low[1] < b
+                array.set(fvgActive, i, false)
+            if d == -1 and high[1] > t
+                array.set(fvgActive, i, false)
+            if DrawFVG
+                bx = array.get(fvgBox, i)
+                if not na(bx)
+                    if array.get(fvgActive, i)
+                        box.set_right(bx, bar_index)
+                    else
+                        box.delete(bx)
+
+f_inActiveFVG(dir, price) =>
+    res = false
+    if array.size(fvgActive) > 0
+        for i = 0 to array.size(fvgActive) - 1
+            if array.get(fvgActive, i) and array.get(fvgDir, i) == dir
+                if price <= array.get(fvgTop, i) and price >= array.get(fvgBot, i)
+                    res := true
+    res
+
+f_inActiveFVGtol(dir, price, tol) =>
+    res = false
+    if array.size(fvgActive) > 0
+        for i = 0 to array.size(fvgActive) - 1
+            if array.get(fvgActive, i) and array.get(fvgDir, i) == dir
+                if price <= array.get(fvgTop, i) + tol and price >= array.get(fvgBot, i) - tol
+                    res := true
+    res
+
+f_bandOverlapsFVG(dir, lo, hi) =>
+    res = false
+    if array.size(fvgActive) > 0
+        for i = 0 to array.size(fvgActive) - 1
+            if array.get(fvgActive, i) and array.get(fvgDir, i) == dir
+                if lo <= array.get(fvgTop, i) and hi >= array.get(fvgBot, i)
+                    res := true
+    res
+
+// Unified continuation FVG-containment gate (v3.3.9 relax parity).
+f_fvgContainOK(dir, price, bandFrom) =>
+    ok = f_inActiveFVG(dir, price)
+    if not ok and RelaxFVGContain
+        if f_inActiveFVGtol(dir, price, fvgTol)
+            ok := true
+        else if UseFVGband
+            lo = math.min(price, bandFrom)
+            hi = math.max(price, bandFrom)
+            if f_bandOverlapsFVG(dir, lo, hi)
+                ok := true
+    ok
+
+// ============================ ORDER BLOCKS ===============================
+var array<float> obTop    = array.new_float()
+var array<float> obBot    = array.new_float()
+var array<int>   obDir    = array.new_int()
+var array<bool>  obActive = array.new_bool()
+var array<box>   obBox    = array.new_box()
+
+f_pushOB(t, b, d) =>
+    array.push(obTop, t)
+    array.push(obBot, b)
+    array.push(obDir, d)
+    array.push(obActive, true)
+    bx = DrawOB ? box.new(bar_index-1, t, bar_index, b, border_color=(d==1?color.green:color.red), bgcolor=na) : na
+    array.push(obBox, bx)
+    if array.size(obTop) > MaxTrackedOB
+        obx = array.shift(obBox)
+        if not na(obx)
+            box.delete(obx)
+        array.shift(obTop)
+        array.shift(obBot)
+        array.shift(obDir)
+        array.shift(obActive)
+
+// Bullish OB = last down-close candle before an up displacement (approx).
+if UseOrderBlocks
+    if f_disp(1) >= DispMinScore and close[2] < open[2]
+        f_pushOB(high[2], low[2], 1)
+    if f_disp(-1) >= DispMinScore and close[2] > open[2]
+        f_pushOB(high[2], low[2], -1)
+
+if array.size(obActive) > 0
+    for i = 0 to array.size(obActive) - 1
+        if array.get(obActive, i)
+            d = array.get(obDir, i)
+            t = array.get(obTop, i)
+            b = array.get(obBot, i)
+            thru = close[1]
+            if d == 1 and thru < b
+                array.set(obActive, i, false)
+            if d == -1 and thru > t
+                array.set(obActive, i, false)
+            if DrawOB
+                bx = array.get(obBox, i)
+                if not na(bx)
+                    if array.get(obActive, i)
+                        box.set_right(bx, bar_index)
+                    else
+                        box.delete(bx)
+
+f_inActiveOB(dir, price) =>
+    res = false
+    if array.size(obActive) > 0
+        for i = 0 to array.size(obActive) - 1
+            if array.get(obActive, i) and array.get(obDir, i) == dir
+                if price <= array.get(obTop, i) and price >= array.get(obBot, i)
+                    res := true
+    res
+
+// ==========================================================================
+//  ICC PULLBACK ENGINE  (Indication -> Correction -> Continuation)
+//  v3.4.0: effMin/effMax fold in the OTE window when useOTE is ON.
+//  v4.0.5: gate diagnostics emitted BEFORE the data guard (call-path fix).
+//  v4.0.7: STRUCTURAL correction definition (EA v4.3.0 parity).
+//  v4.0.8: H4 AUTHORITY -- htfBias may now be driven by extTrend; the gate
+//          diagnostics print BOTH h4cascade and h4ext so the authoritative
+//          value is never ambiguous (mirrors EA v4.2.1 fix B).
+// ==========================================================================
+var int   iccPhase    = 0   // 0 none / 1 indication / 2 correction
+var int   iccDir      = 0
+var float indLevel    = 0.0
+var float indExtreme  = 0.0
+var float corrExtreme = 0.0
+var int   iccStartBar = 0
+var bool  iccBuySig   = false
+var bool  iccSellSig  = false
+var float iccSigSL    = 0.0
+var float mlSigOTEDepth = na
+
+// AUDIT FIX (v4.0.6 / F7-equivalent, mirrors EA v4.0.5 F7): the genuine ICC
+// impulse leg/phase/bar-ages are only available WHILE the ICC state machine
+// still holds them -- by the time the v4 entry-freeze block runs (a
+// different code block, later), iccPhase/indLevel/indExtreme have already
+// been reset. These persistent vars are stamped at the real Indication/
+// Correction phase transitions and captured at the instant a Continuation
+// fires, so the freeze logic below can read a genuine state instead of a
+// hardcoded phase literal or a wrong risk-distance proxy.
+var int   mlIndStartBar  = 0
+var int   mlCorrStartBar = 0
+var float mlSigImpulseLegATR    = na
+var int   mlSigImpulseAgeBars   = na
+var int   mlSigCorrectionAgeBars= na
+var int   mlSigPhaseAtFire      = 0
+
+// v3.4.0 OTE window replaces the raw CorrRetrace bounds inside ICC only.
+effMin = useOTE ? oteMin : CorrRetraceMin
+effMax = useOTE ? oteMax : CorrRetraceMax
+
+iccBuySig  := false
+iccSellSig := false
+iccSigSL   := 0.0
+mlSigImpulseLegATR    := na
+mlSigImpulseAgeBars   := na
+mlSigCorrectionAgeBars:= na
+mlSigPhaseAtFire      := 0
+mlSigOTEDepth := na
+
+// --------------------------------------------------------------------------
+//  v4.0.5 GATE-DIAGNOSTIC CALL-PATH FIX. Emit the [ICC GATE] state BEFORE the
+//  data guard so an HTF-eligible bar ALWAYS reports either its gate reasons
+//  or the reason it aborts. Gated by inpICCGateDiagnostics (+ confirmed bar),
+//  so it stays silent when OFF and never spams intrabar. Diagnostics-only.
+//  v4.0.8: LONG/SHORT lines carry htfSrc (which source is AUTHORITATIVE),
+//  h4cascade (legacy biasH4) and h4ext (extTrend) side by side -- the Pine
+//  analogue of the EA v4.2.1 (B) verbose-line fix, so "why did it trade when
+//  H4 looks bearish" is answerable from one line.
+//  v4.0.7: CONT lines additionally report corrDef, the structural LH/HL and
+//  whether the impulse origin is still held -- all PURE reads.
+// --------------------------------------------------------------------------
+if inpICCGateDiagnostics and barstate.isconfirmed
+    if not UseICCPullback
+        log.info("[ICC GATE] SKIP: UseICCPullback=OFF (ICC engine disabled) | phase={0} dir={1}", iccPhase, iccDir)
+    else if htfBias == 0
+        log.info("[ICC GATE] FLAT: htfBias=0 | authority={0} h4cascade={1} h4ext={2} d1={3} score={4} minConv={5} | phase={6} dir={7}", UseExtTrendAuthority ? "H4EXT" : "CASCADE", biasH4, extTrend, biasD1, htfScore, HTF_MinConviction, iccPhase, iccDir)
+    else if htfBias == 1
+        gExtOK   = (not ExtTrendControlsDir) or extTrend >= 0
+        gSweepOK = (not RequireSweep) or sweepConfLong > 0
+        gDisp    = f_disp(1)
+        gDispOK  = (not RejectWeakBreaks) or gDisp >= DispMinScore
+        gBOS     = not na(wkLastHi) and wkLastHi > 0 and m15c1 > wkLastHi
+        log.info("[ICC GATE] LONG | wkLastHi={0} close={1} BOS={2} | authority={3} h4cascade={4} h4ext={5} score={6} | ext={7} trend={8} | sweep={9} valid={10} | disp={11} min={12} ok={13} | phase={14} dir={15}", wkLastHi, m15c1, gBOS ? 1 : 0, UseExtTrendAuthority ? "H4EXT" : "CASCADE", biasH4, extTrend, htfScore, gExtOK ? 1 : 0, extTrend, gSweepOK ? 1 : 0, sweepConfLong, gDisp, DispMinScore, gDispOK ? 1 : 0, iccPhase, iccDir)
+        if iccPhase == 2 and iccDir == 1
+            gLeg   = indExtreme - indLevel
+            gDisc  = gLeg > 0 ? indExtreme - gLeg * (useOTE ? oteMin : CorrRetraceMin) : 0.0
+            gSEdge = f_structCorrEdge(1, gLeg, indExtreme)
+            gDiscEff = (UseStructuralCorrection and not na(gSEdge)) ? gSEdge : gDisc
+            gOriginHeld = not f_structInval(1, m15c1, indLevel)
+            gFvgOK = (not RequireFVGpullback) or f_fvgContainOK(1, corrExtreme, gDiscEff)
+            gObOK  = (not RequireOB) or (not UseOrderBlocks) or f_inActiveOB(1, corrExtreme)
+            gTrig  = not na(m15h2) and m15c1 > m15h2
+            log.info("[ICC GATE] LONG CONT | leg={0} corr={1} disc={2} | trigger={3} | FVG={4} | OB={5} | corrDef={6} structLH={7} originHeld={8}", gLeg, corrExtreme, gDiscEff, gTrig ? 1 : 0, gFvgOK ? 1 : 0, gObOK ? 1 : 0, UseStructuralCorrection ? "STRUCT" : "FIB", na(gSEdge) ? 0.0 : gSEdge, gOriginHeld ? 1 : 0)
+    else if htfBias == -1
+        gExtOK   = (not ExtTrendControlsDir) or extTrend <= 0
+        gSweepOK = (not RequireSweep) or sweepConfShort > 0
+        gDisp    = f_disp(-1)
+        gDispOK  = (not RejectWeakBreaks) or gDisp >= DispMinScore
+        gBOS     = not na(wkLastLo) and wkLastLo > 0 and m15c1 < wkLastLo
+        log.info("[ICC GATE] SHORT | wkLastLo={0} close={1} BOS={2} | authority={3} h4cascade={4} h4ext={5} score={6} | ext={7} trend={8} | sweep={9} valid={10} | disp={11} min={12} ok={13} | phase={14} dir={15}", wkLastLo, m15c1, gBOS ? 1 : 0, UseExtTrendAuthority ? "H4EXT" : "CASCADE", biasH4, extTrend, htfScore, gExtOK ? 1 : 0, extTrend, gSweepOK ? 1 : 0, sweepConfShort, gDisp, DispMinScore, gDispOK ? 1 : 0, iccPhase, iccDir)
+        if iccPhase == 2 and iccDir == -1
+            gLeg   = indLevel - indExtreme
+            gPrem  = gLeg > 0 ? indExtreme + gLeg * (useOTE ? oteMin : CorrRetraceMin) : 0.0
+            gSEdge = f_structCorrEdge(-1, gLeg, indExtreme)
+            gPremEff = (UseStructuralCorrection and not na(gSEdge)) ? gSEdge : gPrem
+            gOriginHeld = not f_structInval(-1, m15c1, indLevel)
+            gFvgOK = (not RequireFVGpullback) or f_fvgContainOK(-1, corrExtreme, gPremEff)
+            gObOK  = (not RequireOB) or (not UseOrderBlocks) or f_inActiveOB(-1, corrExtreme)
+            gTrig  = not na(m15l2) and m15c1 < m15l2
+            log.info("[ICC GATE] SHORT CONT | leg={0} corr={1} prem={2} | trigger={3} | FVG={4} | OB={5} | corrDef={6} structHL={7} originHeld={8}", gLeg, corrExtreme, gPremEff, gTrig ? 1 : 0, gFvgOK ? 1 : 0, gObOK ? 1 : 0, UseStructuralCorrection ? "STRUCT" : "FIB", na(gSEdge) ? 0.0 : gSEdge, gOriginHeld ? 1 : 0)
+
+// v4.0.5 DATA-GUARD visibility: announce when the lower-TF history is missing
+// (the Pine analogue of the EA tester history gap). Diagnostics-only.
+dataBad = not (not na(m15c1) and not na(wkH1) and not na(wkL1) and m15c1 > 0 and wkH1 > 0 and wkL1 > 0)
+if inpICCGateDiagnostics and barstate.isconfirmed and UseICCPullback and dataBad
+    log.info("[ICC GATE] DATA-GUARD tripped -> ICC update aborted | TrigTF close={0} | WorkTF H1={1} L1={2} | htf={3} phase={4}  (ensure TrigTF+WorkTF history is loaded)", m15c1, wkH1, wkL1, htfBias, iccPhase)
+
+dataOK = UseICCPullback and not na(m15c1) and not na(wkH1) and not na(wkL1) and m15c1 > 0 and wkH1 > 0 and wkL1 > 0
+
+if dataOK
+    // Bias flip cancels an in-progress setup facing the wrong way
+    if iccPhase != 0 and iccDir != 0 and htfBias != 0 and htfBias != iccDir
+        iccPhase := 0
+        iccDir := 0
+        indLevel := 0.0
+        indExtreme := 0.0
+        corrExtreme := 0.0
+        iccStartBar := 0
+
+    // Expiry
+    if iccPhase != 0 and (bar_index - iccStartBar) > ICC_ExpiryBars
+        iccPhase := 0
+        iccDir := 0
+        indLevel := 0.0
+        indExtreme := 0.0
+        corrExtreme := 0.0
+        iccStartBar := 0
+
+    // ==================== BULLISH branch ====================
+    if htfBias == 1
+        if iccPhase == 0
+            extOK   = (not ExtTrendControlsDir) or extTrend >= 0
+            sweepOK = (not RequireSweep) or sweepConfLong > 0
+            dispSc  = RejectWeakBreaks ? f_disp(1) : 100.0
+            dispOK  = (not RejectWeakBreaks) or dispSc >= DispMinScore
+            if RejectWeakBreaks
+                lastDispScore := dispSc
+            if not na(wkLastHi) and wkLastHi > 0 and m15c1 > wkLastHi and extOK and sweepOK and dispOK
+                iccPhase    := 1
+                iccDir      := 1
+                indLevel    := wkLastHi
+                indExtreme  := math.max(wkH1, m15c1)
+                corrExtreme := wkL1
+                iccStartBar := bar_index
+                mlIndStartBar := bar_index   // AUDIT FIX (v4.0.6/F7-eq): stamp Indication start
+        else if iccPhase == 1 and iccDir == 1
+            if wkH1 > indExtreme
+                indExtreme := wkH1
+            leg = indExtreme - indLevel
+            if leg > 0
+                disc  = indExtreme - leg * effMin
+                inval = indExtreme - leg * effMax
+                // v4.0.7 STRUCTURAL (Sci definition, mirrors EA v4.3.0): the
+                // Correction is confirmed by a genuine CONFIRMED LOWER HIGH
+                // forming against the impulse -- not by price touching a 0.50
+                // fib level -- and the setup stays alive as long as the
+                // IMPULSE ORIGIN (indLevel, the protected swing the Indication
+                // broke) is not reclaimed on a body close.
+                sEdge  = f_structCorrEdge(1, leg, indExtreme)
+                sInval = f_structInval(1, m15c1, indLevel)
+                if UseStructuralCorrection
+                    if sInval or (StructCorrKeepMaxDepth and wkL1 <= inval)
+                        iccPhase := 0
+                        iccDir := 0
+                        indLevel := 0.0
+                        indExtreme := 0.0
+                        corrExtreme := 0.0
+                        iccStartBar := 0
+                    else if not na(sEdge)
+                        iccPhase    := 2
+                        corrExtreme := wkL1
+                        mlCorrStartBar := bar_index
+                else if wkL1 <= inval
+                    iccPhase := 0
+                    iccDir := 0
+                    indLevel := 0.0
+                    indExtreme := 0.0
+                    corrExtreme := 0.0
+                    iccStartBar := 0
+                else if wkL1 <= disc
+                    iccPhase    := 2
+                    corrExtreme := wkL1
+                    mlCorrStartBar := bar_index   // AUDIT FIX (v4.0.6/F7-eq)
+        else if iccPhase == 2 and iccDir == 1
+            if wkL1 < corrExtreme
+                corrExtreme := wkL1
+            leg   = indExtreme - indLevel
+            inval = leg > 0 ? indExtreme - leg * effMax : 0.0
+            disc  = leg > 0 ? indExtreme - leg * effMin : corrExtreme
+            // v4.0.7 STRUCTURAL: (a) the deep-fib invalidation is replaced by
+            // the impulse-origin test, and (b) the shallow edge of the pullback
+            // band handed to the FVG-containment test becomes the correction's
+            // OWN confirmed lower high. Both revert exactly when OFF.
+            sEdge2  = f_structCorrEdge(1, leg, indExtreme)
+            discEff = (UseStructuralCorrection and not na(sEdge2)) ? sEdge2 : disc
+            structInval = UseStructuralCorrection and (f_structInval(1, m15c1, indLevel) or (StructCorrKeepMaxDepth and leg > 0 and wkL1 <= inval))
+            fibInval    = leg > 0 and wkL1 <= inval
+            if (UseStructuralCorrection ? structInval : fibInval)
+                iccPhase := 0
+                iccDir := 0
+                indLevel := 0.0
+                indExtreme := 0.0
+                corrExtreme := 0.0
+                iccStartBar := 0
+            else
+                fvgOK = (not RequireFVGpullback) or f_fvgContainOK(1, corrExtreme, discEff)
+                obOK  = (not RequireOB) or (not UseOrderBlocks) or f_inActiveOB(1, corrExtreme)
+                if not na(m15h2) and m15h2 > 0 and m15c1 > m15h2 and fvgOK and obOK
+                    iccBuySig := true
+                    iccSigSL  := corrExtreme - slBuf
+                    mlSigOTEDepth := leg > 0 ? (indExtreme - corrExtreme) / leg : na
+                    // AUDIT FIX (v4.0.6/F7-eq): capture BEFORE the reset below.
+                    mlSigImpulseLegATR     := atrVal > 0 ? leg / atrVal : na
+                    mlSigImpulseAgeBars    := mlCorrStartBar - mlIndStartBar
+                    mlSigCorrectionAgeBars := bar_index - mlCorrStartBar
+                    mlSigPhaseAtFire       := iccPhase
+                    iccPhase := 0
+                    iccDir := 0
+                    indLevel := 0.0
+                    indExtreme := 0.0
+                    corrExtreme := 0.0
+                    iccStartBar := 0
+
+    // ==================== BEARISH branch ====================
+    else if htfBias == -1
+        if iccPhase == 0
+            extOK   = (not ExtTrendControlsDir) or extTrend <= 0
+            sweepOK = (not RequireSweep) or sweepConfShort > 0
+            dispSc  = RejectWeakBreaks ? f_disp(-1) : 100.0
+            dispOK  = (not RejectWeakBreaks) or dispSc >= DispMinScore
+            if RejectWeakBreaks
+                lastDispScore := dispSc
+            if not na(wkLastLo) and wkLastLo > 0 and m15c1 < wkLastLo and extOK and sweepOK and dispOK
+                iccPhase    := 1
+                iccDir      := -1
+                indLevel    := wkLastLo
+                indExtreme  := math.min(wkL1, m15c1)
+                corrExtreme := wkH1
+                iccStartBar := bar_index
+                mlIndStartBar := bar_index   // AUDIT FIX (v4.0.6/F7-eq)
+        else if iccPhase == 1 and iccDir == -1
+            if wkL1 < indExtreme
+                indExtreme := wkL1
+            leg = indLevel - indExtreme
+            if leg > 0
+                prem  = indExtreme + leg * effMin
+                inval = indExtreme + leg * effMax
+                // v4.0.7 STRUCTURAL: mirror of the LONG branch -- CONFIRMED
+                // HIGHER LOW confirms; impulse-origin reclaim invalidates.
+                sEdge  = f_structCorrEdge(-1, leg, indExtreme)
+                sInval = f_structInval(-1, m15c1, indLevel)
+                if UseStructuralCorrection
+                    if sInval or (StructCorrKeepMaxDepth and wkH1 >= inval)
+                        iccPhase := 0
+                        iccDir := 0
+                        indLevel := 0.0
+                        indExtreme := 0.0
+                        corrExtreme := 0.0
+                        iccStartBar := 0
+                    else if not na(sEdge)
+                        iccPhase    := 2
+                        corrExtreme := wkH1
+                        mlCorrStartBar := bar_index
+                else if wkH1 >= inval
+                    iccPhase := 0
+                    iccDir := 0
+                    indLevel := 0.0
+                    indExtreme := 0.0
+                    corrExtreme := 0.0
+                    iccStartBar := 0
+                else if wkH1 >= prem
+                    iccPhase    := 2
+                    corrExtreme := wkH1
+                    mlCorrStartBar := bar_index   // AUDIT FIX (v4.0.6/F7-eq)
+        else if iccPhase == 2 and iccDir == -1
+            if wkH1 > corrExtreme
+                corrExtreme := wkH1
+            leg   = indLevel - indExtreme
+            inval = leg > 0 ? indExtreme + leg * effMax : 0.0
+            prem  = leg > 0 ? indExtreme + leg * effMin : corrExtreme
+            // v4.0.7 STRUCTURAL: mirror of the LONG branch.
+            sEdge2  = f_structCorrEdge(-1, leg, indExtreme)
+            premEff = (UseStructuralCorrection and not na(sEdge2)) ? sEdge2 : prem
+            structInval = UseStructuralCorrection and (f_structInval(-1, m15c1, indLevel) or (StructCorrKeepMaxDepth and leg > 0 and wkH1 >= inval))
+            fibInval    = leg > 0 and wkH1 >= inval
+            if (UseStructuralCorrection ? structInval : fibInval)
+                iccPhase := 0
+                iccDir := 0
+                indLevel := 0.0
+                indExtreme := 0.0
+                corrExtreme := 0.0
+                iccStartBar := 0
+            else
+                fvgOK = (not RequireFVGpullback) or f_fvgContainOK(-1, corrExtreme, premEff)
+                obOK  = (not RequireOB) or (not UseOrderBlocks) or f_inActiveOB(-1, corrExtreme)
+                if not na(m15l2) and m15l2 > 0 and m15c1 < m15l2 and fvgOK and obOK
+                    iccSellSig := true
+                    iccSigSL   := corrExtreme + slBuf
+                    mlSigOTEDepth := leg > 0 ? (corrExtreme - indExtreme) / leg : na
+                    mlSigImpulseLegATR     := atrVal > 0 ? leg / atrVal : na
+                    mlSigImpulseAgeBars    := mlCorrStartBar - mlIndStartBar
+                    mlSigCorrectionAgeBars := bar_index - mlCorrStartBar
+                    mlSigPhaseAtFire       := iccPhase
+                    iccPhase := 0
+                    iccDir := 0
+                    indLevel := 0.0
+                    indExtreme := 0.0
+                    corrExtreme := 0.0
+                    iccStartBar := 0
+    else
+        if iccPhase == 0
+            iccPhase := 0
+            iccDir := 0
+            indLevel := 0.0
+            indExtreme := 0.0
+            corrExtreme := 0.0
+            iccStartBar := 0
+
+// v3.5.0: the light S/R RETEST-confirmation path and the v1 CASCADE breakout
+// path were removed (mirror of the EA cleanup). The genuine Sci ICC pullback
+// is now the ONLY entry path.
+
+// ==========================================================================
+//  v3.4.0 SCI KILL-ZONE GATE. A window may wrap midnight (start>end).
+// ==========================================================================
+f_inKZwin(h, s, e) =>
+    s < e ? (h >= s and h < e) : (h >= s or h < e)
+
+kzHour   = hour(time, kzTz)
+inLon    = kzLon  and f_inKZwin(kzHour, lonStart,  lonEnd)
+inNYam   = kzNYam and f_inKZwin(kzHour, nyamStart, nyamEnd)
+inNYpm   = kzNYpm and f_inKZwin(kzHour, nypmStart, nypmEnd)
+inKZ     = not useKZ ? true : (inLon or inNYam or inNYpm)
+kzActive = not useKZ ? "OFF" : inLon ? "London" : inNYam ? "NY-AM" : inNYpm ? "NY-PM" : "outside"
+
+// v3.8.0: nearest active same-direction FVG to the signal price.
+f_mlFVG(dir, price) =>
+    float mid = na
+    float size = na
+    float best = 1e18
+    if array.size(fvgActive) > 0
+        for i = 0 to array.size(fvgActive) - 1
+            if array.get(fvgActive, i) and array.get(fvgDir, i) == dir
+                t = array.get(fvgTop, i)
+                b = array.get(fvgBot, i)
+                m = (t + b) / 2.0
+                d = math.abs(price - m)
+                if d < best
+                    best := d
+                    mid := m
+                    size := t - b
+    [mid, size]
+
+// ============================ ML FEATURE/DECISION LAYER ==================
+f_countTrue(array<bool> a) =>
+    n = 0
+    if array.size(a) > 0
+        for i = 0 to array.size(a) - 1
+            if array.get(a, i)
+                n += 1
+    n
+
+activeFVG = f_countTrue(fvgActive)
+activeOB  = f_countTrue(obActive)
+
+atrBase = ta.sma(atrVal, 50)
+regimeTrend = math.abs(ta.ema(close, 20) - ta.ema(close, 50)) / math.max(atrVal, syminfo.mintick)
+regimeVol = atrBase > 0 ? atrVal / atrBase : 1.0
+regimeCode = regimeTrend >= 1.0 ? (regimeVol >= 1.15 ? 3 : 2) : (regimeVol >= 1.15 ? 1 : 0)
+regimeTxt = regimeCode == 3 ? "TREND+EXP" : regimeCode == 2 ? "TREND" : regimeCode == 1 ? "RANGE+HIGHVOL" : "RANGE"
+sessionCode = inLon ? 1 : inNYam ? 2 : inNYpm ? 3 : 0
+
+// AUDIT FIX (v4.0.6 / F2, mirrors EA v4.0.5 F2): REBALANCED so that terms the
+// ICC entry gates already GUARANTEE true (HTF match, sweep, FVG presence)
+// carry reduced weight, and terms with genuine per-signal variance
+// (internal-trend agreement, order-block presence, displacement HEADROOM
+// above DispMinScore rather than the raw 0..100 score, regime, session) carry
+// increased weight. Output still clamped to 0.99; remains a PLACEHOLDER
+// surrogate. Re-tune mlMinScore/mlHighMult/mlBaseMult/mlLowMult against the
+// NEW distribution if you rely on FILTER/FILTER+SIZE modes.
+f_mlSurrogate(dir) =>
+    biasPart = htfBias == dir ? 0.05 : 0.0
+    extPart = extTrend == dir ? 0.08 : extTrend == 0 ? 0.03 : 0.0
+    intPart = intTrend == dir ? 0.16 : intTrend == 0 ? 0.06 : 0.0
+    liqPart = dir == 1 ? (sweepConfLong > 0 ? 0.05 : 0.0) : (sweepConfShort > 0 ? 0.05 : 0.0)
+    dispQuality = (RejectWeakBreaks and DispMinScore < 100.0) ? math.max(0.0, math.min(1.0, (lastDispScore - DispMinScore) / (100.0 - DispMinScore))) : math.max(0.0, math.min(1.0, lastDispScore / 100.0))
+    dispPart = dispQuality * 0.22
+    fvgPart = activeFVG > 0 ? 0.03 : 0.0
+    obPart = activeOB > 0 ? 0.14 : 0.0
+    otePart = useOTE ? 0.05 : 0.02
+    sessPart = sessionCode > 0 ? 0.05 : 0.01
+    regPart = regimeCode >= 3 ? 0.05 : regimeCode >= 2 ? 0.03 : 0.0
+    math.min(0.05 + biasPart + extPart + intPart + liqPart + dispPart + fvgPart + obPart + otePart + sessPart + regPart, 0.99)
+
+rawDir = iccBuySig ? 1 : iccSellSig ? -1 : 0
+[mlFVGMid, mlFVGSize] = f_mlFVG(rawDir, close)
+mlFVGMidDist = rawDir != 0 and not na(mlFVGMid) ? math.abs(close - mlFVGMid) : na
+mlFVGMidDistATR = not na(mlFVGMidDist) and atrVal > 0 ? mlFVGMidDist / atrVal : na
+mlFVGSizeATR = not na(mlFVGSize) and atrVal > 0 ? mlFVGSize / atrVal : na
+mlRiskDistance = rawDir != 0 and iccSigSL > 0 ? math.abs(close - iccSigSL) : na
+mlRiskDistanceATR = not na(mlRiskDistance) and atrVal > 0 ? mlRiskDistance / atrVal : na
+mlRiskDistancePips = not na(mlRiskDistance) and pip > 0 ? mlRiskDistance / pip : na
+mlSpreadPrice = syminfo.mintick
+mlSpreadTicks = 1.0
+mlHour = hour(time, kzTz)
+mlMinute = minute(time, kzTz)
+mlMinuteOfDay = mlHour * 60 + mlMinute
+mlTimeSin = math.sin(2.0 * math.pi * mlMinuteOfDay / 1440.0)
+mlTimeCos = math.cos(2.0 * math.pi * mlMinuteOfDay / 1440.0)
+mlSymbol = syminfo.tickerid
+
+mlSurrogate = rawDir != 0 ? f_mlSurrogate(rawDir) : 0.0
+mlP2 = mlSource == "MANUAL/EXTERNAL" ? mlManualP2 : mlSurrogate
+mlP3 = mlSource == "MANUAL/EXTERNAL" ? mlManualP3 : math.max(0.0, mlP2 - 0.15)
+mlP5 = mlSource == "MANUAL/EXTERNAL" ? mlManualP5 : math.max(0.0, mlP2 - 0.38)
+mlP10= mlSource == "MANUAL/EXTERNAL" ? mlManualP10: math.max(0.0, mlP2 - 0.63)
+forecastAgree = rawDir == 0 or not mlRequireForecast or mlForecastDir == 0 or mlForecastDir == rawDir
+mlPass = mlMode == "OFF" or mlMode == "OBSERVE" or (mlP2 >= mlMinScore and forecastAgree)
+mlRiskMult = mlP2 >= 0.85 ? mlHighMult : mlP2 >= 0.70 ? mlBaseMult : mlLowMult
+mlRunnerOK = mlMode == "OFF" or mlMode == "OBSERVE" or mlP3 >= mlRunnerMinP3
+mlStatus = mlMode == "OFF" ? "OFF" : mlPass ? "PASS" : "BLOCK"
+
+// v4.0.8: the signal payload records BOTH the authority mode and the two H4
+// readings, so a dataset that mixes CASCADE and H4EXT runs can be split by arm.
+mlPayload = '{"schema":"icc_ml_v1","symbol":"' + syminfo.ticker + '","time":' + str.tostring(time) + ',"dir":' + str.tostring(rawDir) + ',"htf_score":' + str.tostring(htfScore) + ',"htf_authority":"' + (UseExtTrendAuthority ? "H4EXT" : "CASCADE") + '","h4_cascade":' + str.tostring(biasH4) + ',"ext_trend":' + str.tostring(extTrend) + ',"int_trend":' + str.tostring(intTrend) + ',"sweep_long":' + str.tostring(sweepConfLong) + ',"sweep_short":' + str.tostring(sweepConfShort) + ',"disp":' + str.tostring(lastDispScore) + ',"fvg_active":' + str.tostring(activeFVG) + ',"ob_active":' + str.tostring(activeOB) + ',"atr":' + str.tostring(atrVal) + ',"session":' + str.tostring(sessionCode) + ',"regime":' + str.tostring(regimeCode) + ',"p2":' + str.tostring(mlP2) + ',"p3":' + str.tostring(mlP3) + ',"p5":' + str.tostring(mlP5) + ',"p10":' + str.tostring(mlP10) + ',"forecast_dir":' + str.tostring(mlForecastDir) + ',"forecast_atr":' + str.tostring(mlForecastStrength) + ',"fvg_mid_dist":' + str.tostring(mlFVGMidDist) + ',"fvg_mid_dist_atr":' + str.tostring(mlFVGMidDistATR) + ',"ote_depth":' + str.tostring(mlSigOTEDepth) + ',"fvg_size_atr":' + str.tostring(mlFVGSizeATR) + ',"risk_distance":' + str.tostring(mlRiskDistance) + ',"risk_distance_atr":' + str.tostring(mlRiskDistanceATR) + ',"risk_distance_pips":' + str.tostring(mlRiskDistancePips) + ',"spread_price_proxy":' + str.tostring(mlSpreadPrice) + ',"spread_ticks_proxy":' + str.tostring(mlSpreadTicks) + ',"hour":' + str.tostring(mlHour) + ',"minute_of_day":' + str.tostring(mlMinuteOfDay) + ',"time_sin":' + str.tostring(mlTimeSin) + ',"time_cos":' + str.tostring(mlTimeCos) + ',"symbol_id":"' + mlSymbol + '","correction_definition":"' + (UseStructuralCorrection ? "STRUCTURAL" : "FIB") + '","schema_version":"icc_ml_v1","payload_type":"signal"}'
+if mlExportJSON and rawDir != 0
+    alert(mlPayload, alert.freq_once_per_bar_close)
+
+// ---------------------------------------------------------------------------
+// v3.8.1 STARTUP VERIFICATION PAYLOAD (pipeline test; no trade signal).
+// ---------------------------------------------------------------------------
+var bool mlStartupSent = false
+if mlEmitStartup and not mlStartupSent and barstate.isconfirmed
+    startupPayload = '{"schema":"icc_ml_v1","schema_version":"icc_ml_v1","payload_type":"startup","symbol":"' + syminfo.ticker + '","symbol_id":"' + syminfo.tickerid + '","time":' + str.tostring(time) + ',"ml_mode":"' + mlMode + '","ml_source":"' + mlSource + '","export_json":' + str.tostring(mlExportJSON) + ',"timeframe":"' + timeframe.period + '","htf_authority":"' + (UseExtTrendAuthority ? "H4EXT" : "CASCADE") + '","correction_definition":"' + (UseStructuralCorrection ? "STRUCTURAL" : "FIB") + '","note":"pipeline verification - no ICC signal"}'
+    alert(startupPayload, alert.freq_once_per_bar_close)
+    mlStartupSent := true
+
+plot(mlP2, "ML P(2R)", display=display.data_window)
+plot(mlP3, "ML P(3R)", display=display.data_window)
+plot(mlP5, "ML P(5R)", display=display.data_window)
+plot(mlP10,"ML P(10R)", display=display.data_window)
+plot(regimeCode, "ML regime code", display=display.data_window)
+plot(sessionCode, "ML session code", display=display.data_window)
+plot(extTrend, "H4ext trend (authoritative when H4 AUTHORITY on)", display=display.data_window)
+plot(biasH4, "H4 cascade bias (legacy/display)", display=display.data_window)
+plot(mlFVGMidDistATR, "ML FVG midpoint distance ATR", display=display.data_window)
+plot(mlSigOTEDepth, "ML OTE depth", display=display.data_window)
+plot(mlFVGSizeATR, "ML FVG size ATR", display=display.data_window)
+plot(mlRiskDistanceATR, "ML risk distance ATR", display=display.data_window)
+plot(mlRiskDistancePips, "ML risk distance pips", display=display.data_window)
+plot(mlSpreadTicks, "ML spread ticks proxy", display=display.data_window)
+plot(mlMinuteOfDay, "ML minute of day", display=display.data_window)
+plot(mlTimeSin, "ML time sin", display=display.data_window)
+plot(mlTimeCos, "ML time cos", display=display.data_window)
+
+// ============================ SIGNAL ROUTING =============================
+// v3.5.0: the ONLY entry signal is the Sci ICC continuation.
+buySig  = iccBuySig
+sellSig = iccSellSig
+canEnter = (not useKZ) or inKZ
+curPos = strategy.position_size
+extRevLong  = extTrend == -1
+extRevShort = extTrend == 1
+
+if CloseOnOpposite and curPos > 0 and sellSig and ((not useRexit) or (not closeOnConfirmedRev) or extRevLong)
+    strategy.close("LONG", comment="EXIT LONG")
+if CloseOnOpposite and curPos < 0 and buySig and ((not useRexit) or (not closeOnConfirmedRev) or extRevShort)
+    strategy.close("SHORT", comment="EXIT SHORT")
+
+// ---- Structural / RR take-profit + SL resolution ------------------------
+f_structTP(dir, entryPx) =>
+    best = 0.0
+    if dir > 0
+        hh = ta.highest(high, TPLookback)[1]
+        best := (not na(hh) and hh > entryPx) ? hh : 0.0
+    else
+        ll = ta.lowest(low, TPLookback)[1]
+        best := (not na(ll) and ll > 0 and ll < entryPx) ? ll : 0.0
+    best
+
+f_resolveTP(dir, entryPx, d) =>
+    tpx = dir > 0 ? entryPx + d * RR_Ratio : entryPx - d * RR_Ratio
+    if TPMode == "Structural"
+        lvl = f_structTP(dir, entryPx)
+        if lvl > 0.0
+            dist = dir > 0 ? (lvl - entryPx) : (entryPx - lvl)
+            if dist >= syminfo.mintick * 10 and dist >= d * TPMinRR
+                tpx := lvl
+    tpx
+
+canLong  = canEnter and strategy.position_size == 0
+canShort = canEnter and strategy.position_size == 0
+
+longTrigger  = iccBuySig and mlPass
+shortTrigger = iccSellSig and mlPass
+
+// --- runner/exit state (persists across bars; reset when flat) ------------
+var float runEntry = na
+var float runStop  = na
+var float runPeak  = na
+var int   runDir   = 0
+var float runRisk  = na
+var bool  runPartialDone = false
+var bool  runMLRunner = true
+var float rxCurR   = 0.0
+var string rxHealth= "-"
+
+// ---- v3.9.0 icc_ml_v2 per-trade recorder (frozen features + reached-R) ------
+var float  v2Entry = na
+var float  v2Risk  = na
+var int    v2Dir   = 0
+var float  v2MFER  = 0.0
+var float  v2MAER  = 0.0
+var bool   v2R1 = false
+var bool   v2R2 = false
+var bool   v2R3 = false
+var bool   v2R5 = false
+var bool   v2R10 = false
+var int    v2T2Rbar = na
+var int    v2EntryBar = na
+var float  v2fHTF = na
+var int    v2fExt = 0
+var int    v2fInt = 0
+var int    v2fSweepL = 0
+var int    v2fSweepS = 0
+var float  v2fDisp = na
+var int    v2fFVG = 0
+var int    v2fOB = 0
+var float  v2fATR = na
+var int    v2fSession = 0
+var int    v2fRegime = 0
+var float  v2fFVGdistATR = na
+var float  v2fOTE = na
+var float  v2fFVGsizeATR = na
+var float  v2fRiskDistATR = na
+var int    v2fHour = 0
+var int    v2fMinOfDay = 0
+var float  v2fTsin = na
+var float  v2fTcos = na
+var float  v2fP2 = na
+var float  v2fRiskMult = na
+var string v2Sym = ""
+var float  v2LastPos = 0.0
+
+// ---- v4.0 canonical recorder (mirror of EA ICC_ML_dataset_v4) ---------------
+var string v4RunId = na
+if na(v4RunId)
+    v4RunId := str.tostring(timenow) + "_" + syminfo.ticker + "_" + timeframe.period
+var int    v4Seq        = 0
+var string v4TradeId    = ""
+var float  v4EntryPx    = na
+var float  v4InitSL     = na
+var float  v4InitRisk   = na
+var int    v4Phase      = 0
+var float  v4ImpulseLegATR = na
+var int    v4ImpulseAgeBars    = na
+var int    v4CorrectionAgeBars = na
+var float  v4CorrDepth  = na
+var float  v4DistExtHighATR = na
+var float  v4DistExtLowATR  = na
+var float  v4DistIntHighATR = na
+var float  v4DistIntLowATR  = na
+var int    v4EntryTime  = na
+// v4.0.7 / v4.0.8: record WHICH correction definition and WHICH HTF authority
+// governed the setup, so a mixed dataset can always be split by arm.
+var string v4CorrDef    = ""
+var string v4HtfAuth    = ""
+var int    v4H4Cascade  = 0
+var float  v4Mfe30m = 0.0
+var float  v4Mfe1h  = 0.0
+var float  v4Mfe2h  = 0.0
+var float  v4Mfe4h  = 0.0
+var float  v4Mfe8h  = 0.0
+var float  v4Mfe24h = 0.0
+var bool   v4Cp30m = false
+var bool   v4Cp1h  = false
+var bool   v4Cp2h  = false
+var bool   v4Cp4h  = false
+var bool   v4Cp8h  = false
+var bool   v4Cp24h = false
+
+// pip inputs -> price distances (mirror of the EA point inputs)
+runArm   = RunnerArmPips   * pip
+runLock  = RunnerLockPips  * pip
+runTrail = RunnerTrailPips * pip
+
+// reset the runner state whenever flat (state is per-open-position, like the EA)
+if strategy.position_size == 0
+    runDir   := 0
+    runEntry := na
+    runStop  := na
+    runPeak  := na
+    runRisk  := na
+    runPartialDone := false
+    runMLRunner := true
+
+if canLong and longTrigger
+    entryPx  = close
+    slAnchor = iccSigSL > 0 ? iccSigSL : wkLastLo
+    slDist   = math.max(entryPx - slAnchor, atrVal * ATR_Multiplier)
+    slDist  := math.max(slDist, slBuf)
+    slPrice  = entryPx - slDist
+    runMLRunner := mlRunnerOK
+    tpPrice  = ((LetWinnersRun or useRexit) and runMLRunner) ? na : f_resolveTP(1, entryPx, slDist)
+    mlQty = mlMode == "FILTER+SIZE" ? (strategy.equity * (mlBaseEquityPct * mlRiskMult) / 100.0) / close : na
+    strategy.entry("LONG", strategy.long, qty=mlQty, comment="ICC BUY")
+    strategy.exit("LONG-x", from_entry="LONG", stop=slPrice, limit=tpPrice, comment="exit")
+    v2Entry := entryPx
+    v2Risk  := slDist
+    v2Dir   := 1
+    v2MFER  := 0.0
+    v2MAER  := 0.0
+    v2R1 := false
+    v2R2 := false
+    v2R3 := false
+    v2R5 := false
+    v2R10 := false
+    v2T2Rbar := na
+    v2EntryBar := bar_index
+    v2fHTF := htfScore
+    v2fExt := extTrend
+    v2fInt := intTrend
+    v2fSweepL := sweepConfLong
+    v2fSweepS := sweepConfShort
+    v2fDisp := lastDispScore
+    v2fFVG := activeFVG
+    v2fOB := activeOB
+    v2fATR := atrVal
+    v2fSession := sessionCode
+    v2fRegime := regimeCode
+    v2fFVGdistATR := mlFVGMidDistATR
+    v2fOTE := mlSigOTEDepth
+    v2fFVGsizeATR := mlFVGSizeATR
+    v2fRiskDistATR := mlRiskDistanceATR
+    v2fHour := mlHour
+    v2fMinOfDay := mlMinuteOfDay
+    v2fTsin := mlTimeSin
+    v2fTcos := mlTimeCos
+    v2fP2 := mlP2
+    v2fRiskMult := mlRiskMult
+    v2Sym := syminfo.tickerid
+    runEntry := entryPx
+    runStop  := slPrice
+    runPeak  := entryPx
+    runDir   := 1
+    runRisk  := slDist
+    runPartialDone := false
+
+if canShort and shortTrigger
+    entryPx  = close
+    slAnchor = iccSigSL > 0 ? iccSigSL : wkLastHi
+    slDist   = math.max(slAnchor - entryPx, atrVal * ATR_Multiplier)
+    slDist  := math.max(slDist, slBuf)
+    slPrice  = entryPx + slDist
+    runMLRunner := mlRunnerOK
+    tpPrice  = ((LetWinnersRun or useRexit) and runMLRunner) ? na : f_resolveTP(-1, entryPx, slDist)
+    mlQty = mlMode == "FILTER+SIZE" ? (strategy.equity * (mlBaseEquityPct * mlRiskMult) / 100.0) / close : na
+    strategy.entry("SHORT", strategy.short, qty=mlQty, comment="ICC SELL")
+    strategy.exit("SHORT-x", from_entry="SHORT", stop=slPrice, limit=tpPrice, comment="exit")
+    v2Entry := entryPx
+    v2Risk  := slDist
+    v2Dir   := -1
+    v2MFER  := 0.0
+    v2MAER  := 0.0
+    v2R1 := false
+    v2R2 := false
+    v2R3 := false
+    v2R5 := false
+    v2R10 := false
+    v2T2Rbar := na
+    v2EntryBar := bar_index
+    v2fHTF := htfScore
+    v2fExt := extTrend
+    v2fInt := intTrend
+    v2fSweepL := sweepConfLong
+    v2fSweepS := sweepConfShort
+    v2fDisp := lastDispScore
+    v2fFVG := activeFVG
+    v2fOB := activeOB
+    v2fATR := atrVal
+    v2fSession := sessionCode
+    v2fRegime := regimeCode
+    v2fFVGdistATR := mlFVGMidDistATR
+    v2fOTE := mlSigOTEDepth
+    v2fFVGsizeATR := mlFVGSizeATR
+    v2fRiskDistATR := mlRiskDistanceATR
+    v2fHour := mlHour
+    v2fMinOfDay := mlMinuteOfDay
+    v2fTsin := mlTimeSin
+    v2fTcos := mlTimeCos
+    v2fP2 := mlP2
+    v2fRiskMult := mlRiskMult
+    v2Sym := syminfo.tickerid
+    runEntry := entryPx
+    runStop  := slPrice
+    runPeak  := entryPx
+    runDir   := -1
+    runRisk  := slDist
+    runPartialDone := false
+
+// ---- v4.0 canonical: freeze the extra v4 fields on a fresh entry ---------
+if v2EntryBar == bar_index and v2Dir != 0
+    v4Seq       := v4Seq + 1
+    v4TradeId   := v4RunId + "_" + str.tostring(v4Seq)
+    v4EntryPx   := v2Entry
+    v4InitRisk  := v2Risk
+    v4InitSL    := v2Dir > 0 ? v2Entry - v2Risk : v2Entry + v2Risk
+    v4Phase     := mlSigPhaseAtFire
+    v4ImpulseLegATR := mlSigImpulseLegATR
+    v4ImpulseAgeBars    := mlSigImpulseAgeBars
+    v4CorrectionAgeBars := mlSigCorrectionAgeBars
+    v4CorrDepth := mlSigOTEDepth
+    v4CorrDef   := UseStructuralCorrection ? "STRUCTURAL" : "FIB"        // v4.0.7
+    v4HtfAuth   := UseExtTrendAuthority ? "H4EXT" : "CASCADE"            // v4.0.8
+    v4H4Cascade := biasH4                                               // v4.0.8
+    v4DistExtHighATR := (not na(extProtHigh) and atrVal > 0) ? math.abs(extProtHigh - close) / atrVal : na
+    v4DistExtLowATR  := (not na(extProtLow)  and atrVal > 0) ? math.abs(close - extProtLow)  / atrVal : na
+    v4DistIntHighATR := (not na(intProtHigh) and atrVal > 0) ? math.abs(intProtHigh - close) / atrVal : na
+    v4DistIntLowATR  := (not na(intProtLow)  and atrVal > 0) ? math.abs(close - intProtLow)  / atrVal : na
+    v4EntryTime := time
+    v4Mfe30m := 0.0
+    v4Mfe1h  := 0.0
+    v4Mfe2h  := 0.0
+    v4Mfe4h  := 0.0
+    v4Mfe8h  := 0.0
+    v4Mfe24h := 0.0
+    v4Cp30m := false
+    v4Cp1h  := false
+    v4Cp2h  := false
+    v4Cp4h  := false
+    v4Cp8h  := false
+    v4Cp24h := false
+
+// ---- v3.5.0 LET WINNERS RUN: per-bar profit-lock ratchet -----------------
+if LetWinnersRun and runMLRunner and not useRexit and strategy.position_size != 0 and runDir != 0
+    if runDir > 0
+        runPeak := math.max(runPeak, high)
+        pp      = close - runEntry
+        newStop = runStop
+        if pp >= runArm
+            newStop := math.max(newStop, runEntry + runLock)
+            if runTrail > 0
+                newStop := math.max(newStop, runPeak - runTrail)
+            if RunnerUseStruct and not na(intProtLow)
+                newStop := math.max(newStop, intProtLow - slBuf)
+        newStop := math.min(newStop, close - syminfo.mintick)
+        if newStop > runStop
+            runStop := newStop
+            strategy.exit("LONG-x", from_entry="LONG", stop=runStop, comment="run")
+    else
+        runPeak := math.min(runPeak, low)
+        pp      = runEntry - close
+        newStop = runStop
+        if pp >= runArm
+            newStop := math.min(newStop, runEntry - runLock)
+            if runTrail > 0
+                newStop := math.min(newStop, runPeak + runTrail)
+            if RunnerUseStruct and not na(intProtHigh)
+                newStop := math.min(newStop, intProtHigh + slBuf)
+        newStop := math.max(newStop, close + syminfo.mintick)
+        if newStop < runStop
+            runStop := newStop
+            strategy.exit("SHORT-x", from_entry="SHORT", stop=runStop, comment="run")
+
+// ---- v3.6.0 R-MULTIPLE EXIT ENGINE (mirror of EA RX_ManageOne) -----------
+// v4.0.8: when H4 AUTHORITY is ON, extProtHigh/Low and extTrend below are the
+// H4-scoped values, so both the external structure trail and the trend-health
+// governor now key off H4 -- matching the EA.
+if useRexit and runMLRunner and strategy.position_size != 0 and runDir != 0 and not na(runRisk) and runRisk > 0
+    avg   = strategy.position_avg_price
+    isLong= runDir > 0
+    curR  = isLong ? (close - avg) / runRisk : (avg - close) / runRisk
+    health = not useTrendHealth ? 0 : isLong ? (extTrend == -1 ? 2 : intTrend == -1 ? 1 : 0) : (extTrend == 1 ? 2 : intTrend == 1 ? 1 : 0)
+    rxCurR   := curR
+    rxHealth := health == 2 ? "REVERSAL" : health == 1 ? "CAUTION" : "HEALTHY"
+    if useTrendHealth and health == 2
+        strategy.close(isLong ? "LONG" : "SHORT", comment="EXIT ext-reversal")
+    else
+        if usePartial and not runPartialDone and curR >= activateAtR
+            strategy.close(isLong ? "LONG" : "SHORT", qty_percent=partialPct, comment="PARTIAL +" + str.tostring(activateAtR, "#.#") + "R")
+            runPartialDone := true
+        lockR = -1e18
+        if curR >= protectAtR
+            lockR := math.max(lockR, protectLockR)
+        if curR >= lockAtR
+            lockR := math.max(lockR, lockProfitR)
+        if curR >= activateAtR
+            lockR := math.max(lockR, curR - runnerGiveBackR)
+        cand = isLong ? -1e18 : 1e18
+        have = false
+        if lockR > -1e17
+            fp = isLong ? avg + math.max(lockR, 0.0) * runRisk : avg - math.max(lockR, 0.0) * runRisk
+            cand := isLong ? math.max(cand, fp) : math.min(cand, fp)
+            have := true
+        if curR >= activateAtR
+            useInt = runnerInternStruct or (health == 1)
+            useExt = runnerExternStruct
+            if isLong
+                if useExt and not na(extProtLow)
+                    cand := math.max(cand, extProtLow - slBuf)
+                    have := true
+                if useInt and not na(intProtLow)
+                    cand := math.max(cand, intProtLow - slBuf)
+                    have := true
+                if runnerATRFloor and atrVal > 0
+                    cand := math.max(cand, close - atrVal * runnerATRfloorMult)
+                    have := true
+            else
+                if useExt and not na(extProtHigh)
+                    cand := math.min(cand, extProtHigh + slBuf)
+                    have := true
+                if useInt and not na(intProtHigh)
+                    cand := math.min(cand, intProtHigh + slBuf)
+                    have := true
+                if runnerATRFloor and atrVal > 0
+                    cand := math.min(cand, close + atrVal * runnerATRfloorMult)
+                    have := true
+        if have
+            newStop = cand
+            if isLong
+                newStop := math.min(newStop, close - syminfo.mintick)
+                if na(runStop) or newStop > runStop
+                    runStop := newStop
+                    strategy.exit("LONG-x", from_entry="LONG", stop=runStop, comment="Rrun")
+            else
+                newStop := math.max(newStop, close + syminfo.mintick)
+                if na(runStop) or newStop < runStop
+                    runStop := newStop
+                    strategy.exit("SHORT-x", from_entry="SHORT", stop=runStop, comment="Rrun")
+
+// ============================ ML v2 TRADE TRACKING =======================
+if strategy.position_size != 0 and v2Dir != 0 and not na(v2Risk) and v2Risk > 0
+    favR = v2Dir > 0 ? (high - v2Entry) / v2Risk : (v2Entry - low) / v2Risk
+    advR = v2Dir > 0 ? (v2Entry - low) / v2Risk : (high - v2Entry) / v2Risk
+    v2MFER := math.max(v2MFER, favR)
+    v2MAER := math.max(v2MAER, advR)
+    if not v2R1 and v2MFER >= 1.0
+        v2R1 := true
+    if not v2R2 and v2MFER >= 2.0
+        v2R2 := true
+        v2T2Rbar := bar_index
+    if not v2R3 and v2MFER >= 3.0
+        v2R3 := true
+    if not v2R5 and v2MFER >= 5.0
+        v2R5 := true
+    if not v2R10 and v2MFER >= 10.0
+        v2R10 := true
+    if not na(v4EntryTime)
+        v4AgeSec = (time - v4EntryTime) / 1000
+        if v4AgeSec >= 1800  and not v4Cp30m
+            v4Mfe30m := v2MFER
+            v4Cp30m := true
+        if v4AgeSec >= 3600  and not v4Cp1h
+            v4Mfe1h := v2MFER
+            v4Cp1h := true
+        if v4AgeSec >= 7200  and not v4Cp2h
+            v4Mfe2h := v2MFER
+            v4Cp2h := true
+        if v4AgeSec >= 14400 and not v4Cp4h
+            v4Mfe4h := v2MFER
+            v4Cp4h := true
+        if v4AgeSec >= 28800 and not v4Cp8h
+            v4Mfe8h := v2MFER
+            v4Cp8h := true
+        if v4AgeSec >= 86400 and not v4Cp24h
+            v4Mfe24h := v2MFER
+            v4Cp24h := true
+
+if mlEmitTradeJSON and v2LastPos != 0 and strategy.position_size == 0 and v2Dir != 0
+    idxC = strategy.closedtrades - 1
+    exitPrice  = idxC >= 0 ? strategy.closedtrades.exit_price(idxC)  : close
+    profC      = idxC >= 0 ? strategy.closedtrades.profit(idxC)      : 0.0
+    exitR      = v2Risk > 0 ? (v2Dir > 0 ? (exitPrice - v2Entry) : (v2Entry - exitPrice)) / v2Risk : na
+    barsTo2R   = na(v2T2Rbar) ? -1 : (v2T2Rbar - v2EntryBar)
+    tradePayload = '{"schema":"icc_ml_v2","payload_type":"trade","symbol":"' + syminfo.ticker + '","symbol_id":"' + v2Sym + '","dir":' + str.tostring(v2Dir) + ',"entry_price":' + str.tostring(v2Entry) + ',"initial_risk":' + str.tostring(v2Risk) + ',"mfe_r":' + str.tostring(v2MFER) + ',"mae_r":' + str.tostring(v2MAER) + ',"reached_1r":' + (v2R1?"1":"0") + ',"reached_2r":' + (v2R2?"1":"0") + ',"reached_3r":' + (v2R3?"1":"0") + ',"reached_5r":' + (v2R5?"1":"0") + ',"reached_10r":' + (v2R10?"1":"0") + ',"bars_to_2r":' + str.tostring(barsTo2R) + ',"exit_price":' + str.tostring(exitPrice) + ',"exit_r":' + str.tostring(exitR) + ',"exit_money":' + str.tostring(profC) + ',"htf_score":' + str.tostring(v2fHTF) + ',"ext_trend":' + str.tostring(v2fExt) + ',"int_trend":' + str.tostring(v2fInt) + ',"sweep_long":' + str.tostring(v2fSweepL) + ',"sweep_short":' + str.tostring(v2fSweepS) + ',"disp":' + str.tostring(v2fDisp) + ',"fvg_active":' + str.tostring(v2fFVG) + ',"ob_active":' + str.tostring(v2fOB) + ',"atr":' + str.tostring(v2fATR) + ',"session":' + str.tostring(v2fSession) + ',"regime":' + str.tostring(v2fRegime) + ',"fvg_mid_dist_atr":' + str.tostring(v2fFVGdistATR) + ',"ote_depth":' + str.tostring(v2fOTE) + ',"fvg_size_atr":' + str.tostring(v2fFVGsizeATR) + ',"risk_distance_atr":' + str.tostring(v2fRiskDistATR) + ',"hour":' + str.tostring(v2fHour) + ',"minute_of_day":' + str.tostring(v2fMinOfDay) + ',"time_sin":' + str.tostring(v2fTsin) + ',"time_cos":' + str.tostring(v2fTcos) + ',"surrogate_p2":' + str.tostring(v2fP2) + ',"risk_mult":' + str.tostring(v2fRiskMult) + ',"correction_definition":"' + v4CorrDef + '","htf_authority":"' + v4HtfAuth + '","h4_cascade":' + str.tostring(v4H4Cascade) + '}'
+    alert(tradePayload, alert.freq_once_per_bar_close)
+
+    // ------------------------------------------------------------------
+    //  v4.0 CANONICAL TRADE PAYLOAD (mirror of EA ICC_ML_dataset_v4.csv).
+    //  Leakage-free: every label is derived only from post-entry excursion.
+    //  v4.0.7 added "correction_definition"; v4.0.8 adds "htf_authority" and
+    //  "h4_cascade" so a dataset that mixes arms can always be split.
+    //  PARITY DEBT: schema_version stays "4.0.1" -- the EA is at "4.0.2"
+    //  (money layer), which Pine cannot compute without OrderCalcProfit.
+    // ------------------------------------------------------------------
+    if mlEmitV4JSON
+        xStructBreak = (extTrend != v2Dir) or (intTrend != v2Dir)
+        xOppSig      = (v2Dir > 0 and iccSellSig) or (v2Dir < 0 and iccBuySig)
+        v4p2 = mlV4IncludeSurrogate ? str.tostring(v2fP2) : "null"
+        v4Payload = '{"dataset_version":"ICC_ML_v4","schema_version":"4.0.1","payload_type":"trade","run_id":"' + v4RunId + '","trade_id":"' + v4TradeId + '","trade_seq":' + str.tostring(v4Seq) + ',"symbol":"' + syminfo.ticker + '","symbol_id":"' + v2Sym + '","period":"' + timeframe.period + '","dir":' + str.tostring(v2Dir) + ',"digits":' + str.tostring(-math.round(math.log10(syminfo.mintick))) + ',"mintick":' + str.tostring(syminfo.mintick) + ',"pip":' + str.tostring(pip) + ',"broker":"' + syminfo.prefix + '","account_currency":"' + syminfo.currency + '","entry_time":' + str.tostring(v4EntryTime) + ',"exit_time":' + str.tostring(time) + ',"entry_price":' + str.tostring(v4EntryPx) + ',"initial_stop":' + str.tostring(v4InitSL) + ',"initial_risk":' + str.tostring(v4InitRisk) + ',"initial_risk_pips":' + str.tostring(pip > 0 ? v4InitRisk / pip : na) + ',"htf_score":' + str.tostring(v2fHTF) + ',"htf_authority":"' + v4HtfAuth + '","h4_cascade":' + str.tostring(v4H4Cascade) + ',"ext_trend":' + str.tostring(v2fExt) + ',"int_trend":' + str.tostring(v2fInt) + ',"sweep_long":' + str.tostring(v2fSweepL) + ',"sweep_short":' + str.tostring(v2fSweepS) + ',"displacement":' + str.tostring(v2fDisp) + ',"fvg_active":' + str.tostring(v2fFVG) + ',"ob_active":' + str.tostring(v2fOB) + ',"atr":' + str.tostring(v2fATR) + ',"session":' + str.tostring(v2fSession) + ',"regime":' + str.tostring(v2fRegime) + ',"fvg_mid_dist_atr":' + str.tostring(v2fFVGdistATR) + ',"ote_depth":' + str.tostring(v2fOTE) + ',"fvg_size_atr":' + str.tostring(v2fFVGsizeATR) + ',"risk_distance_atr":' + str.tostring(v2fRiskDistATR) + ',"hour":' + str.tostring(v2fHour) + ',"minute_of_day":' + str.tostring(v2fMinOfDay) + ',"time_sin":' + str.tostring(v2fTsin) + ',"time_cos":' + str.tostring(v2fTcos) + ',"icc_phase":' + str.tostring(v4Phase) + ',"impulse_age_bars":' + str.tostring(v4ImpulseAgeBars) + ',"impulse_leg_atr":' + str.tostring(v4ImpulseLegATR) + ',"correction_age_bars":' + str.tostring(v4CorrectionAgeBars) + ',"correction_depth":' + str.tostring(v4CorrDepth) + ',"correction_definition":"' + v4CorrDef + '","distance_to_external_high_atr":' + str.tostring(v4DistExtHighATR) + ',"distance_to_external_low_atr":' + str.tostring(v4DistExtLowATR) + ',"distance_to_internal_high_atr":' + str.tostring(v4DistIntHighATR) + ',"distance_to_internal_low_atr":' + str.tostring(v4DistIntLowATR) + ',"mfe_r":' + str.tostring(v2MFER) + ',"mae_r":' + str.tostring(v2MAER) + ',"reached_1r":' + (v2R1?"1":"0") + ',"reached_2r":' + (v2R2?"1":"0") + ',"reached_3r":' + (v2R3?"1":"0") + ',"reached_5r":' + (v2R5?"1":"0") + ',"reached_10r":' + (v2R10?"1":"0") + ',"bars_to_2r":' + str.tostring(barsTo2R) + ',"mfe_30m_r":' + str.tostring(v4Mfe30m) + ',"mfe_1h_r":' + str.tostring(v4Mfe1h) + ',"mfe_2h_r":' + str.tostring(v4Mfe2h) + ',"mfe_4h_r":' + str.tostring(v4Mfe4h) + ',"mfe_8h_r":' + str.tostring(v4Mfe8h) + ',"mfe_24h_r":' + str.tostring(v4Mfe24h) + ',"exit_price":' + str.tostring(exitPrice) + ',"exit_r":' + str.tostring(exitR) + ',"exit_money":' + str.tostring(profC) + ',"exit_external_trend":' + str.tostring(extTrend) + ',"exit_internal_trend":' + str.tostring(intTrend) + ',"exit_structure_break":' + (xStructBreak?"1":"0") + ',"exit_opposite_signal":' + (xOppSig?"1":"0") + ',"exit_fvg_active":' + str.tostring(activeFVG) + ',"exit_ob_active":' + str.tostring(activeOB) + ',"exit_atr":' + str.tostring(atrVal) + ',"surrogate_p2":' + v4p2 + ',"risk_mult":' + str.tostring(v2fRiskMult) + ',"model_version":"SURROGATE_PENDING"}'
+        alert(v4Payload, alert.freq_once_per_bar_close)
+    v2Dir := 0
+
+v2LastPos := strategy.position_size
+
+// ============================ EXIT LABELS ================================
+var float lastPosSize = 0.0
+if ShowExitLabels and lastPosSize != 0 and strategy.position_size == 0
+    idx  = strategy.closedtrades - 1
+    prof = idx >= 0 ? strategy.closedtrades.profit(idx) : 0.0
+    wasLong = lastPosSize > 0
+    col  = prof >= 0 ? ExitWinColor : ExitLossColor
+    txt  = "x EXIT" + (ExitLblShowProfit ? "  " + str.tostring(prof, "#.##") : "")
+    label.new(bar_index, close, txt, style=wasLong ? label.style_label_down : label.style_label_up, color=col, textcolor=color.white, size=size.small)
+lastPosSize := strategy.position_size
+
+// Entry markers
+plotshape(iccBuySig,  title="ICC Buy",  style=shape.triangleup,   location=location.belowbar, color=color.lime, size=size.tiny)
+plotshape(iccSellSig, title="ICC Sell", style=shape.triangledown, location=location.abovebar, color=color.red,  size=size.tiny)
+
+// ============================ DASHBOARD ==================================
+f_arrow(b) => b == 1 ? "▲" : b == -1 ? "▼" : "–"
+var table dash = table.new(position.top_right, 2, 24, border_width=1)
+if ShowDashboard and barstate.islast
+    table.clear(dash, 0, 0, 1, 23)
+    flMoney = strategy.openprofit
+    flPips  = strategy.position_size > 0 ? (close - strategy.position_avg_price) / pip : strategy.position_size < 0 ? (strategy.position_avg_price - close) / pip : 0.0
+    flSgn   = flMoney >= 0 ? "+" : ""
+    flCol   = strategy.position_size == 0 ? color.gray : flMoney >= 0 ? color.teal : color.red
+    table.cell(dash, 0, 0, "ICC TradesBySci v4.0.8", text_color=color.white, bgcolor=color.new(color.navy, 0), text_size=size.small)
+    table.cell(dash, 1, 0, "SMC", text_color=color.white, bgcolor=color.new(color.navy, 0), text_size=size.small)
+    table.cell(dash, 0, 1, "Cascade D1/H4/H1/M15", text_size=size.tiny)
+    table.cell(dash, 1, 1, f_arrow(biasD1)+" "+f_arrow(biasH4)+" "+f_arrow(biasH1)+" "+f_arrow(biasM15)+"  ["+(alignBull?"^L":alignBear?"vS":"x")+"]", text_size=size.tiny)
+    // v4.0.8: WHICH H4 is authoritative, with both readings side by side.
+    table.cell(dash, 0, 2, "H4 authority", text_size=size.tiny)
+    table.cell(dash, 1, 2, (UseExtTrendAuthority ? "H4EXT (MidTF struct)" : "CASCADE (legacy)")+"   h4c="+f_arrow(biasH4)+" h4ext="+f_arrow(extTrend), text_color=UseExtTrendAuthority ? color.teal : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 3, "HTF bias / score", text_size=size.tiny)
+    table.cell(dash, 1, 3, (htfBias==1?"▲ BULL":htfBias==-1?"▼ BEAR":"– flat")+"  "+str.tostring(htfScore, "#.##"), text_size=size.tiny)
+    table.cell(dash, 0, 4, "ICC phase (dir)", text_size=size.tiny)
+    table.cell(dash, 1, 4, (iccPhase==1?"IND":iccPhase==2?"COR":"---")+" ("+str.tostring(iccDir)+")  [only entry]", text_size=size.tiny)
+    table.cell(dash, 0, 5, "Correction def", text_size=size.tiny)
+    table.cell(dash, 1, 5, UseStructuralCorrection ? ("STRUCTURAL (LH/HL, floor "+str.tostring(StructCorrMinRetrace,"#.##")+(StructCorrKeepMaxDepth?", +maxcap":"")+")") : ("FIB "+str.tostring(CorrRetraceMin,"#.##")+"-"+str.tostring(CorrRetraceMax,"#.##")), text_color=UseStructuralCorrection ? color.teal : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 6, "External / Internal trend", text_size=size.tiny)
+    table.cell(dash, 1, 6, f_arrow(extTrend)+" / "+f_arrow(intTrend), text_size=size.tiny)
+    table.cell(dash, 0, 7, "Liquidity", text_size=size.tiny)
+    table.cell(dash, 1, 7, liqStatus, text_size=size.tiny)
+    table.cell(dash, 0, 8, "Displacement", text_size=size.tiny)
+    table.cell(dash, 1, 8, str.tostring(lastDispScore, "#")+"/100", text_size=size.tiny)
+    table.cell(dash, 0, 9, "Active FVG / OB", text_size=size.tiny)
+    table.cell(dash, 1, 9, str.tostring(array.size(fvgActive))+" / "+str.tostring(array.size(obActive)), text_size=size.tiny)
+    table.cell(dash, 0, 10, "TP mode", text_size=size.tiny)
+    table.cell(dash, 1, 10, (LetWinnersRun or useRexit) ? "RUNNER (no fixed TP)" : TPMode, text_size=size.tiny)
+    table.cell(dash, 0, 11, "FVG contain", text_size=size.tiny)
+    table.cell(dash, 1, 11, RelaxFVGContain ? "RELAX"+(UseFVGband?"+band":"") : "STRICT", text_size=size.tiny)
+    table.cell(dash, 0, 12, "Kill-zone", text_size=size.tiny)
+    table.cell(dash, 1, 12, useKZ ? ("ON → "+kzActive+(inKZ?"  [OPEN]":"  [SHUT]")) : "OFF (all hours)", text_color=useKZ and not inKZ ? color.red : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 13, "OTE window", text_size=size.tiny)
+    table.cell(dash, 1, 13, useOTE ? ("ON "+str.tostring(oteMin,"#.##")+"-"+str.tostring(oteMax,"#.##")) : ("OFF (Corr "+str.tostring(CorrRetraceMin,"#.##")+"-"+str.tostring(CorrRetraceMax,"#.##")+")"), text_size=size.tiny)
+    table.cell(dash, 0, 14, "Position", text_size=size.tiny)
+    table.cell(dash, 1, 14, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "flat", text_size=size.tiny)
+    table.cell(dash, 0, 15, "Closed trades", text_size=size.tiny)
+    table.cell(dash, 1, 15, str.tostring(strategy.closedtrades), text_size=size.tiny)
+    table.cell(dash, 0, 16, "Runner", text_size=size.tiny)
+    table.cell(dash, 1, 16, LetWinnersRun ? ("ON arm="+str.tostring(RunnerArmPips,"#.#")+" lock="+str.tostring(RunnerLockPips,"#.#")+" trail="+str.tostring(RunnerTrailPips,"#.#")+(RunnerUseStruct?"+struct":"")) : "OFF", text_color=LetWinnersRun ? color.teal : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 17, "Exit R-eng", text_size=size.tiny)
+    table.cell(dash, 1, 17, useRexit ? ("ON prot="+str.tostring(protectAtR,"#.#")+"R lock@"+str.tostring(lockAtR,"#.#")+"R/+"+str.tostring(lockProfitR,"#.#")+"R act="+str.tostring(activateAtR,"#.#")+"R give="+str.tostring(runnerGiveBackR,"#.#")+"R"+(runnerExternStruct?" +E":"")+(runnerInternStruct?" +I":"")) : "OFF (legacy runner)", text_color=useRexit ? color.teal : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 18, "pos R / health", text_size=size.tiny)
+    table.cell(dash, 1, 18, (useRexit and strategy.position_size != 0) ? (str.tostring(rxCurR,"#.00")+"R  "+rxHealth+(usePartial?("  part="+str.tostring(partialPct,"#")+"%"):"")) : "-", text_color=rxHealth=="REVERSAL" ? color.red : rxHealth=="CAUTION" ? color.orange : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 19, "Floating P/L", text_size=size.tiny)
+    table.cell(dash, 1, 19, strategy.position_size == 0 ? "flat" : flSgn+str.tostring(flMoney,"#.##")+"  ( "+flSgn+str.tostring(flPips,"#.#")+" pips )", text_color=flCol, text_size=size.tiny)
+    table.cell(dash, 0, 20, "ML quality", text_size=size.tiny)
+    table.cell(dash, 1, 20, mlStatus+" P2="+str.tostring(mlP2,"#.00")+" P3="+str.tostring(mlP3,"#.00"), text_color=mlPass?color.teal:color.red, text_size=size.tiny)
+    table.cell(dash, 0, 21, "ML sizing / runner", text_size=size.tiny)
+    table.cell(dash, 1, 21, "x"+str.tostring(mlRiskMult,"#.00")+" / "+(mlRunnerOK?"RUN":"FIXED"), text_size=size.tiny)
+    table.cell(dash, 0, 22, "Regime / forecast", text_size=size.tiny)
+    table.cell(dash, 1, 22, regimeTxt+" / "+(forecastAgree?"AGREE":"CONFLICT"), text_size=size.tiny)
+    table.cell(dash, 0, 23, "ICC gate diag", text_size=size.tiny)
+    table.cell(dash, 1, 23, inpICCGateDiagnostics ? "ON (log)" : "OFF", text_color=inpICCGateDiagnostics ? color.teal : color.gray, text_size=size.tiny)
+
+// ============================ ALERTS =====================================
+alertcondition(iccBuySig,  "ICC Buy",  "ICC BUY continuation {{ticker}}")
+alertcondition(iccSellSig, "ICC Sell", "ICC SELL continuation {{ticker}}")

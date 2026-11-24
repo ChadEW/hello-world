@@ -1,0 +1,325 @@
+//@version=6
+// =====================================================================
+// ICC Strategy — Pine port of ICC_Strategy_EA_v4_0 (MQL5)
+// Indication -> Correction -> Continuation, TradesBySci style
+// Cascade: D1 -> H4 -> H1 -> 15m with correlation gate
+// Symbol-aware SL/TP using syminfo.mintick + ATR, R-multiple targets
+// Author: built for Chad Woodyard, July 2026
+// =====================================================================
+strategy("ICC Strategy [v4.0]",
+     shorttitle              = "ICC-Strat-v4",
+     overlay                 = true,
+     pyramiding              = 0,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 2,
+     initial_capital         = 10000,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.02,
+     slippage                = 2,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false,
+     max_lines_count         = 500,
+     max_labels_count        = 500,
+     max_boxes_count         = 500)
+
+// ---------- INPUTS ---------------------------------------------------
+grpStruct  = "Structure / Swing Detection"
+swingLen   = input.int(5,    "Swing pivot length (bars L/R)", minval = 2, group = grpStruct, tooltip = "5 approximates Sci's clean H1 swings.")
+showLabels = input.bool(true,"Show HH / HL / LH / LL labels", group = grpStruct)
+maxSwings  = input.int(6,    "Max recent swing lines kept",   minval = 2, maxval = 20, group = grpStruct)
+
+grpCol     = "Color Scheme (Sci style)"
+colHigh    = input.color(color.new(#1E88E5, 0),      "Swing High (sellers' line)", group = grpCol)
+colLow     = input.color(color.new(#E53935, 0),      "Swing Low (buyers' line)",   group = grpCol)
+colBull    = input.color(color.new(color.green, 80), "Bullish correction zone",    group = grpCol)
+colBear    = input.color(color.new(color.red,   80), "Bearish correction zone",    group = grpCol)
+colNeutral = input.color(color.new(color.gray,  85), "Neutral / unclear zone",     group = grpCol)
+
+grpTF      = "Timeframe Cascade (D1 -> H4 -> H1 -> 15m)"
+biasTF     = input.timeframe("D",    "Top bias TF (Indication)",  group = grpTF)
+midTF      = input.timeframe("240",  "Mid TF (Correction map)",   group = grpTF)
+workTF     = input.timeframe("60",   "Working TF (Continuation)", group = grpTF)
+trigTF     = input.timeframe("15",   "Trigger TF (Entry timing)", group = grpTF)
+strictAlign= input.bool(true, "Require ALL four TFs to agree", group = grpTF, tooltip = "If off, only working & trigger must agree (more signals, lower quality).")
+
+grpRisk    = "Risk / Money Management (symbol-aware)"
+atrLen     = input.int(14,   "ATR length",                    minval = 5,   group = grpRisk)
+atrTF      = input.timeframe("60", "ATR timeframe",           group = grpRisk, tooltip = "H1 is the EA v4.0 default.")
+slAtrMult  = input.float(1.5,"SL = ATR x",                    minval = 0.2, step = 0.1, group = grpRisk)
+rMultiple  = input.float(2.0,"TP R-multiple (reward / risk)", minval = 0.5, step = 0.1, group = grpRisk)
+useSwingSL = input.bool(true,"Prefer swing-based SL when tighter than ATR SL", group = grpRisk, tooltip = "Mirrors v4.0 EA: use last opposing swing if it gives a tighter, still-valid stop.")
+minStopPts = input.int(10,   "Min stop distance (points, safety floor)", minval = 0, group = grpRisk, tooltip = "Analogue of SYMBOL_TRADE_STOPS_LEVEL. 1 point = syminfo.mintick.")
+maxSpreadPts = input.int(30, "Max allowed spread (points) — 0 disables", minval = 0, group = grpRisk, tooltip = "Analogue of SYMBOL_SPREAD guard in the EA.")
+useBE      = input.bool(true, "Move SL to break-even at +1R", group = grpRisk)
+useTrail   = input.bool(false,"Trail SL by ATR x mult after +1R", group = grpRisk)
+trailMult  = input.float(1.5, "Trail ATR x", minval = 0.2, step = 0.1, group = grpRisk)
+
+grpSess    = "Session Filter"
+useNYHrs   = input.bool(false, "Restrict entries to NY session (09:00–16:00 NY)", group = grpSess)
+
+grpDiag    = "Diagnostics"
+showSig    = input.bool(true,  "Plot entry arrows",     group = grpDiag)
+showSL     = input.bool(true,  "Plot SL / TP lines",    group = grpDiag)
+showDash   = input.bool(true,  "Show cascade dashboard",group = grpDiag)
+showDiag   = input.bool(true,  "Show broker-condition diagnostics", group = grpDiag, tooltip = "Analogue of the EA's OnInit prints for stops-level & spread.")
+
+// ---------- BROKER-CONDITION DIAGNOSTICS -----------------------------
+// Pine has no direct SYMBOL_TRADE_STOPS_LEVEL / SYMBOL_SPREAD, so we
+// synthesize equivalents from syminfo.mintick and (high-low) proxies.
+tick         = syminfo.mintick
+pointsPerBar = (high - low) / tick
+spreadProxy  = math.max(1.0, ta.sma(pointsPerBar, 20) * 0.02)   // ~2% of avg range, in points
+
+// ---------- SWING ENGINE ---------------------------------------------
+// Returns +1 = bullish structure (HH+HL), -1 = bearish (LH+LL), 0 = unclear
+f_bias(_tf) =>
+    [ph1, pl1] = request.security(syminfo.tickerid, _tf, [ta.pivothigh(swingLen, swingLen), ta.pivotlow(swingLen, swingLen)], lookahead = barmerge.lookahead_off)
+    var float lastH1 = na
+    var float prevH1 = na
+    var float lastL1 = na
+    var float prevL1 = na
+    if not na(ph1)
+        prevH1 := lastH1
+        lastH1 := ph1
+    if not na(pl1)
+        prevL1 := lastL1
+        lastL1 := pl1
+    haveAll    = not na(lastH1) and not na(prevH1) and not na(lastL1) and not na(prevL1)
+    bullStruct = haveAll and lastH1 > prevH1 and lastL1 > prevL1
+    bearStruct = haveAll and lastH1 < prevH1 and lastL1 < prevL1
+    bias       = bullStruct ? 1 : bearStruct ? -1 : 0
+    bias
+
+biasD1  = f_bias(biasTF)
+biasH4  = f_bias(midTF)
+biasH1  = f_bias(workTF)
+biasM15 = f_bias(trigTF)
+
+// ---------- WORKING-TF SWINGS (for SL anchors + continuation break) --
+var float wkLastHi = na
+var float wkPrevHi = na
+var float wkLastLo = na
+var float wkPrevLo = na
+
+wkHi = request.security(syminfo.tickerid, workTF, ta.pivothigh(swingLen, swingLen), lookahead = barmerge.lookahead_off)
+wkLo = request.security(syminfo.tickerid, workTF, ta.pivotlow (swingLen, swingLen), lookahead = barmerge.lookahead_off)
+
+if not na(wkHi)
+    wkPrevHi := wkLastHi
+    wkLastHi := wkHi
+if not na(wkLo)
+    wkPrevLo := wkLastLo
+    wkLastLo := wkLo
+
+// Trigger-TF close for continuation confirmation
+trigClose = request.security(syminfo.tickerid, trigTF, close, lookahead = barmerge.lookahead_off)
+
+// ATR on the risk timeframe
+atrVal = request.security(syminfo.tickerid, atrTF, ta.atr(atrLen), lookahead = barmerge.lookahead_off)
+
+// ---------- CHART MARKING (Sci-style) --------------------------------
+phChart = ta.pivothigh(swingLen, swingLen)
+plChart = ta.pivotlow (swingLen, swingLen)
+
+var line[]  hiLines  = array.new<line>()
+var line[]  loLines  = array.new<line>()
+var label[] hiLabels = array.new<label>()
+var label[] loLabels = array.new<label>()
+
+f_trim(arr, lblArr, maxN) =>
+    while array.size(arr) > maxN
+        line.delete(array.shift(arr))
+        if array.size(lblArr) > 0
+            label.delete(array.shift(lblArr))
+
+var float prevHi = na
+var float prevLo = na
+
+if not na(phChart)
+    px = high[swingLen]
+    ln = line.new(bar_index[swingLen], px, bar_index, px, color = colHigh, width = 2, extend = extend.right, style = line.style_solid)
+    array.push(hiLines, ln)
+    if showLabels
+        tag = na(prevHi) ? "H" : (px > prevHi ? "HH" : "LH")
+        lb = label.new(bar_index[swingLen], px, tag, style = label.style_label_down, color = colHigh, textcolor = color.white, size = size.tiny)
+        array.push(hiLabels, lb)
+        prevHi := px
+    f_trim(hiLines, hiLabels, maxSwings)
+
+if not na(plChart)
+    px = low[swingLen]
+    ln = line.new(bar_index[swingLen], px, bar_index, px, color = colLow, width = 2, extend = extend.right, style = line.style_solid)
+    array.push(loLines, ln)
+    if showLabels
+        tag = na(prevLo) ? "L" : (px > prevLo ? "HL" : "LL")
+        lb = label.new(bar_index[swingLen], px, tag, style = label.style_label_up, color = colLow, textcolor = color.white, size = size.tiny)
+        array.push(loLabels, lb)
+        prevLo := px
+    f_trim(loLines, loLabels, maxSwings)
+
+// ---------- CORRELATION GATE -----------------------------------------
+strictBull = biasD1 ==  1 and biasH4 ==  1 and biasH1 ==  1 and biasM15 ==  1
+looseBull  = biasH1 ==  1 and biasM15 ==  1
+strictBear = biasD1 == -1 and biasH4 == -1 and biasH1 == -1 and biasM15 == -1
+looseBear  = biasH1 == -1 and biasM15 == -1
+
+fullAlignBull = strictAlign ? strictBull : looseBull
+fullAlignBear = strictAlign ? strictBear : looseBear
+
+// ---------- CONTINUATION TRIGGERS ------------------------------------
+buyContinuation  = fullAlignBull and not na(wkLastHi) and trigClose > wkLastHi
+sellContinuation = fullAlignBear and not na(wkLastLo) and trigClose < wkLastLo
+
+// Session filter
+nyHour     = hour(time, "America/New_York")
+inNyWindow = nyHour >= 9 and nyHour < 16
+nySession  = not useNYHrs or inNyWindow
+
+buyContinuation  := buyContinuation  and nySession
+sellContinuation := sellContinuation and nySession
+
+// Broker-condition gate (spread guard, EA parity)
+spreadOk = maxSpreadPts == 0 or spreadProxy <= maxSpreadPts
+
+buySig  = buyContinuation  and not buyContinuation[1]  and spreadOk
+sellSig = sellContinuation and not sellContinuation[1] and spreadOk
+
+// ---------- SL / TP CALCULATION (symbol-aware) -----------------------
+minStopPrice = minStopPts * tick
+
+// ATR-based stop distance
+atrStopDist  = atrVal * slAtrMult
+
+// BUY side
+buyAtrSL   = close - atrStopDist
+buySwingSL = wkLastLo
+buySL_raw  = useSwingSL and not na(buySwingSL) and buySwingSL < close and (close - buySwingSL) < atrStopDist and (close - buySwingSL) >= minStopPrice ? buySwingSL : buyAtrSL
+// Enforce minimum stop distance
+buySL      = (close - buySL_raw) < minStopPrice ? close - minStopPrice : buySL_raw
+buyRisk    = close - buySL
+buyTP      = close + buyRisk * rMultiple
+
+// SELL side
+sellAtrSL  = close + atrStopDist
+sellSwingSL= wkLastHi
+sellSL_raw = useSwingSL and not na(sellSwingSL) and sellSwingSL > close and (sellSwingSL - close) < atrStopDist and (sellSwingSL - close) >= minStopPrice ? sellSwingSL : sellAtrSL
+sellSL     = (sellSL_raw - close) < minStopPrice ? close + minStopPrice : sellSL_raw
+sellRisk   = sellSL - close
+sellTP     = close - sellRisk * rMultiple
+
+// ---------- STRATEGY ENTRIES / EXITS ---------------------------------
+// Persist SL/TP for the active trade so break-even / trailing can adjust
+var float activeSL = na
+var float activeTP = na
+var float entryPx  = na
+var float initRisk = na
+var int   dir      = 0     // 1 long, -1 short, 0 flat
+
+if buySig and strategy.position_size <= 0
+    strategy.entry("ICC Long", strategy.long)
+    activeSL := buySL
+    activeTP := buyTP
+    entryPx  := close
+    initRisk := buyRisk
+    dir      := 1
+
+if sellSig and strategy.position_size >= 0
+    strategy.entry("ICC Short", strategy.short)
+    activeSL := sellSL
+    activeTP := sellTP
+    entryPx  := close
+    initRisk := sellRisk
+    dir      := -1
+
+// Break-even + optional ATR trail (EA v4.0 parity)
+if strategy.position_size > 0 and dir == 1 and not na(entryPx) and not na(initRisk)
+    if useBE and high >= entryPx + initRisk and activeSL < entryPx
+        activeSL := entryPx
+    if useTrail and high >= entryPx + initRisk
+        trailSL = close - atrVal * trailMult
+        if trailSL > activeSL
+            activeSL := trailSL
+
+if strategy.position_size < 0 and dir == -1 and not na(entryPx) and not na(initRisk)
+    if useBE and low <= entryPx - initRisk and activeSL > entryPx
+        activeSL := entryPx
+    if useTrail and low <= entryPx - initRisk
+        trailSL = close + atrVal * trailMult
+        if trailSL < activeSL
+            activeSL := trailSL
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit",  from_entry = "ICC Long",  stop = activeSL, limit = activeTP)
+if strategy.position_size < 0
+    strategy.exit("Short Exit", from_entry = "ICC Short", stop = activeSL, limit = activeTP)
+
+// Reset trade state when flat
+if strategy.position_size == 0
+    activeSL := na
+    activeTP := na
+    entryPx  := na
+    initRisk := na
+    dir      := 0
+
+// ---------- CORRECTION ZONE BOX --------------------------------------
+var box corrBox = na
+biasZone = biasH1
+zoneCol  = biasZone == 1 ? colBull : biasZone == -1 ? colBear : colNeutral
+
+if not na(phChart) or not na(plChart)
+    topPx = not na(wkLastHi) ? wkLastHi : high
+    botPx = not na(wkLastLo) ? wkLastLo : low
+    if not na(corrBox)
+        box.delete(corrBox)
+    corrBox := box.new(bar_index - 30, topPx, bar_index + 10, botPx, border_color = color.new(color.gray, 60), bgcolor = zoneCol, extend = extend.right)
+
+// ---------- ENTRY ARROWS + SL / TP MARKERS ---------------------------
+plotshape(showSig and buySig,  title = "BUY Continuation",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime, 0), size = size.small, text = "ICC^")
+plotshape(showSig and sellSig, title = "SELL Continuation", style = shape.triangledown, location = location.abovebar, color = color.new(color.red,  0), size = size.small, text = "ICCv")
+
+if showSL and buySig
+    line.new(bar_index, buySL, bar_index + 20, buySL, color = color.red,   style = line.style_dashed, width = 1)
+    line.new(bar_index, buyTP, bar_index + 20, buyTP, color = color.green, style = line.style_dashed, width = 1)
+if showSL and sellSig
+    line.new(bar_index, sellSL, bar_index + 20, sellSL, color = color.red,   style = line.style_dashed, width = 1)
+    line.new(bar_index, sellTP, bar_index + 20, sellTP, color = color.green, style = line.style_dashed, width = 1)
+
+// ---------- DASHBOARD ------------------------------------------------
+var table dash = table.new(position.top_right, 2, 8, border_width = 1)
+
+f_biasTxt(b) =>
+    b == 1 ? "^ BULL" : b == -1 ? "v BEAR" : "- flat"
+
+f_biasCol(b) =>
+    bullCol = color.new(color.green, 70)
+    bearCol = color.new(color.red,   70)
+    flatCol = color.new(color.gray,  70)
+    b == 1 ? bullCol : b == -1 ? bearCol : flatCol
+
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "TF",   bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(dash, 1, 0, "Bias", bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(dash, 0, 1, biasTF, text_color = color.white)
+    table.cell(dash, 1, 1, f_biasTxt(biasD1),  bgcolor = f_biasCol(biasD1))
+    table.cell(dash, 0, 2, midTF,  text_color = color.white)
+    table.cell(dash, 1, 2, f_biasTxt(biasH4),  bgcolor = f_biasCol(biasH4))
+    table.cell(dash, 0, 3, workTF, text_color = color.white)
+    table.cell(dash, 1, 3, f_biasTxt(biasH1),  bgcolor = f_biasCol(biasH1))
+    table.cell(dash, 0, 4, trigTF, text_color = color.white)
+    table.cell(dash, 1, 4, f_biasTxt(biasM15), bgcolor = f_biasCol(biasM15))
+
+    alignedTxt = fullAlignBull ? "^ ALIGNED LONG" : fullAlignBear ? "v ALIGNED SHORT" : "x NOT ALIGNED"
+    alignedBg  = fullAlignBull ? color.new(color.green, 40) : fullAlignBear ? color.new(color.red, 40) : color.new(color.gray, 40)
+    table.cell(dash, 0, 5, "Cascade", text_color = color.white)
+    table.cell(dash, 1, 5, alignedTxt, bgcolor = alignedBg, text_color = color.white)
+
+    // Broker-condition diagnostics (EA v4.0 OnInit parity)
+    if showDiag
+        table.cell(dash, 0, 6, "Min stop (pts)", text_color = color.white)
+        table.cell(dash, 1, 6, str.tostring(minStopPts), text_color = color.white)
+        table.cell(dash, 0, 7, "Spread proxy (pts)", text_color = color.white)
+        table.cell(dash, 1, 7, str.tostring(spreadProxy, "#.#"), text_color = spreadOk ? color.new(color.green, 40) : color.new(color.red, 40))
+
+// ---------- ALERTS (webhook-ready JSON) ------------------------------
+alertcondition(buySig,  "ICC BUY Continuation",  '{"symbol":"{{ticker}}","tf":"{{interval}}","side":"BUY","price":{{close}},"strategy":"ICC-v4.0"}')
+alertcondition(sellSig, "ICC SELL Continuation", '{"symbol":"{{ticker}}","tf":"{{interval}}","side":"SELL","price":{{close}},"strategy":"ICC-v4.0"}')
